@@ -350,38 +350,26 @@ pub fn render_lcd_dashboard(
         write_lcd_segment(deck, 2, &left, seg_w);
         write_lcd_segment(deck, 3, &right, seg_w);
     } else {
-        // Segment 2: Reviews > Pet
-        {
-            let reviews = dashboard.review_requests;
-            if reviews > 0 {
-                let img = render_lcd_segment("Reviews", Some(&format!("{} waiting", reviews)), seg_w, strip_h);
-                write_lcd_segment(deck, 2, &img, seg_w);
-            } else if let Ok(p) = pet.lock() {
-                let img = render_pet_segment(&p, seg_w, strip_h);
-                write_lcd_segment(deck, 2, &img, seg_w);
-            } else {
-                let img = render_lcd_segment("PRs", Some(&format!("{} open", dashboard.my_pr_count)), seg_w, strip_h);
-                write_lcd_segment(deck, 2, &img, seg_w);
-            }
-        }
+        // Wide pet scene (400x100) with info overlay
+        // Timer/meeting info appears overlaid in the scene
+        let info_text = if let Some(ref time_str) = timer_display {
+            Some(format!("⏱ {}", time_str))
+        } else if dashboard.next_meeting_mins >= 0 && dashboard.next_meeting_mins <= 60 {
+            Some(format!("{} in {}m", truncate(&dashboard.next_meeting, 12), dashboard.next_meeting_mins))
+        } else if dashboard.review_requests > 0 {
+            Some(format!("{} reviews waiting", dashboard.review_requests))
+        } else if dashboard.mergeable_count > 0 {
+            Some(format!("{} ready to merge", dashboard.mergeable_count))
+        } else {
+            None
+        };
 
-        // Segment 3: Timer > Meeting > Merge > Issues
-        {
-            let enc_label = encoders.get("3").and_then(|e| e.label.as_deref()).unwrap_or("");
-            let (l, v) = if let Some(ref time_str) = timer_display {
-                ("Timer".to_string(), time_str.clone())
-            } else if dashboard.next_meeting_mins >= 0 && dashboard.next_meeting_mins <= 60 {
-                (truncate(&dashboard.next_meeting, 10), format!("in {}m", dashboard.next_meeting_mins))
-            } else if dashboard.mergeable_count > 0 {
-                ("Merge".into(), format!("{} ready", dashboard.mergeable_count))
-            } else if dashboard.my_issue_count > 0 {
-                ("Issues".into(), format!("{}", dashboard.my_issue_count))
-            } else {
-                (enc_label.to_string(), String::new())
-            };
-            let v_ref = if v.is_empty() { None } else { Some(v.as_str()) };
-            let img = render_lcd_segment(&l, v_ref, seg_w, strip_h);
-            write_lcd_segment(deck, 3, &img, seg_w);
+        if let Ok(p) = pet.lock() {
+            let img = render_pet_wide(&p, info_text.as_deref(), seg_w * 2, strip_h);
+            let left = img.view(0, 0, seg_w, strip_h).to_image();
+            let right = img.view(seg_w, 0, seg_w, strip_h).to_image();
+            write_lcd_segment(deck, 2, &left, seg_w);
+            write_lcd_segment(deck, 3, &right, seg_w);
         }
     }
 }
@@ -501,7 +489,8 @@ fn render_notification_banner(deck: &mut StreamDeck, message: &str, created: std
     }
 }
 
-fn render_pet_segment(pet: &crate::tamagotchi::Pet, width: u32, height: u32) -> RgbaImage {
+#[allow(dead_code)]
+fn render_pet_segment_old(pet: &crate::tamagotchi::Pet, width: u32, height: u32) -> RgbaImage {
     let bg = Rgba([12, 12, 20, 255]);
     let mut img = RgbaImage::from_pixel(width, height, bg);
 
@@ -554,6 +543,348 @@ fn render_pet_segment(pet: &crate::tamagotchi::Pet, width: u32, height: u32) -> 
     let hunger_filled = (pet.hunger as i32 * bar_w / 100).max(0);
     draw_filled_rect_mut(&mut img, Rect::at(8, bar_y + 8).of_size(bar_w as u32, bar_h as u32), Rgba([30, 30, 45, 255]));
     draw_filled_rect_mut(&mut img, Rect::at(8, bar_y + 8).of_size(hunger_filled as u32, bar_h as u32), Rgba([200, 120, 40, 255]));
+
+    img
+}
+
+/// Render the pet in a wide 400x100 scene with pixel art
+fn render_pet_wide(
+    pet: &crate::tamagotchi::Pet,
+    info: Option<&str>,
+    width: u32,
+    height: u32,
+) -> RgbaImage {
+    use crate::tamagotchi::{Action, Mood, Species};
+    use imageproc::drawing::{draw_filled_circle_mut, draw_hollow_circle_mut};
+
+    let bg = Rgba([10, 10, 22, 255]);
+    let mut img = RgbaImage::from_pixel(width, height, bg);
+    let f = font();
+    let fb = font_bold();
+
+    // Ground line
+    let ground_y = 72_i32;
+    draw_filled_rect_mut(
+        &mut img,
+        Rect::at(0, ground_y).of_size(width, 2),
+        Rgba([30, 30, 50, 255]),
+    );
+
+    // Pet position — moves based on action
+    let frame = pet.sprite().len() as i32; // use sprite len as frame proxy
+    let base_x = match pet.action {
+        Action::Walking => {
+            let cycle = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() / 500) as i32;
+            80 + ((cycle % 8) - 4).abs() * 30 // walks back and forth
+        }
+        Action::Dancing => {
+            let cycle = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() / 300) as i32;
+            160 + (cycle % 4 - 2) * 8 // small bounce
+        }
+        _ => 160, // centered-ish
+    };
+
+    let blink = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() / 100) as u32;
+    let is_blink_frame = blink % 30 == 0; // blink every ~3 seconds
+
+    // Colors
+    let body_color = match pet.species {
+        Species::Cat => Rgba([255, 180, 100, 255]),     // orange tabby
+        Species::Dog => Rgba([180, 140, 100, 255]),     // golden
+        Species::Penguin => Rgba([60, 60, 80, 255]),    // dark blue-grey
+        Species::Ghost => Rgba([200, 200, 240, 180]),   // translucent white
+    };
+    let accent_color = match pet.species {
+        Species::Cat => Rgba([255, 220, 180, 255]),     // lighter belly
+        Species::Dog => Rgba([220, 190, 150, 255]),
+        Species::Penguin => Rgba([240, 240, 255, 255]), // white belly
+        Species::Ghost => Rgba([230, 230, 255, 200]),
+    };
+    let eye_color = Rgba([30, 30, 40, 255]);
+    let nose_color = match pet.species {
+        Species::Cat | Species::Dog => Rgba([200, 100, 100, 255]),
+        Species::Penguin => Rgba([255, 180, 50, 255]),  // orange beak
+        Species::Ghost => Rgba([100, 100, 160, 255]),
+    };
+
+    let cx = base_x;
+    let cy = ground_y - 20; // body center
+
+    match pet.species {
+        Species::Cat => {
+            // Body — oval
+            draw_filled_circle_mut(&mut img, (cx, cy), 16, body_color);
+            draw_filled_circle_mut(&mut img, (cx, cy + 4), 14, body_color);
+            // Belly
+            draw_filled_circle_mut(&mut img, (cx, cy + 6), 10, accent_color);
+            // Head
+            draw_filled_circle_mut(&mut img, (cx, cy - 14), 12, body_color);
+            // Ears (triangles via small circles)
+            draw_filled_circle_mut(&mut img, (cx - 10, cy - 24), 5, body_color);
+            draw_filled_circle_mut(&mut img, (cx + 10, cy - 24), 5, body_color);
+            draw_filled_circle_mut(&mut img, (cx - 10, cy - 24), 3, Rgba([255, 140, 120, 255]));
+            draw_filled_circle_mut(&mut img, (cx + 10, cy - 24), 3, Rgba([255, 140, 120, 255]));
+            // Eyes
+            if is_blink_frame || pet.mood == Mood::Sleeping {
+                // Closed eyes — happy lines
+                draw_filled_rect_mut(&mut img, Rect::at(cx - 7, cy - 15).of_size(4, 2), eye_color);
+                draw_filled_rect_mut(&mut img, Rect::at(cx + 3, cy - 15).of_size(4, 2), eye_color);
+            } else {
+                draw_filled_circle_mut(&mut img, (cx - 5, cy - 15), 3, eye_color);
+                draw_filled_circle_mut(&mut img, (cx + 5, cy - 15), 3, eye_color);
+                // Pupils — look direction based on action
+                let pupil_offset = match pet.action {
+                    Action::LookingAround => if blink % 6 < 3 { -1 } else { 1 },
+                    Action::Walking => if cx > 200 { 1 } else { -1 },
+                    _ => 0,
+                };
+                draw_filled_circle_mut(&mut img, (cx - 5 + pupil_offset, cy - 15), 1, Rgba([255, 255, 255, 255]));
+                draw_filled_circle_mut(&mut img, (cx + 5 + pupil_offset, cy - 15), 1, Rgba([255, 255, 255, 255]));
+            }
+            // Nose
+            draw_filled_circle_mut(&mut img, (cx, cy - 11), 2, nose_color);
+            // Whiskers
+            draw_filled_rect_mut(&mut img, Rect::at(cx - 16, cy - 12).of_size(8, 1), Rgba([200, 160, 120, 255]));
+            draw_filled_rect_mut(&mut img, Rect::at(cx + 8, cy - 12).of_size(8, 1), Rgba([200, 160, 120, 255]));
+            // Tail
+            let tail_wave = if blink % 4 < 2 { 0 } else { 3 };
+            draw_filled_circle_mut(&mut img, (cx + 20, cy - 2 + tail_wave), 3, body_color);
+            draw_filled_circle_mut(&mut img, (cx + 24, cy - 6 + tail_wave), 3, body_color);
+            draw_filled_circle_mut(&mut img, (cx + 26, cy - 10 + tail_wave), 3, body_color);
+            // Feet
+            draw_filled_circle_mut(&mut img, (cx - 8, cy + 14), 4, body_color);
+            draw_filled_circle_mut(&mut img, (cx + 8, cy + 14), 4, body_color);
+        }
+        Species::Dog => {
+            // Body
+            draw_filled_circle_mut(&mut img, (cx, cy), 16, body_color);
+            draw_filled_circle_mut(&mut img, (cx, cy + 4), 14, body_color);
+            draw_filled_circle_mut(&mut img, (cx, cy + 6), 10, accent_color);
+            // Head
+            draw_filled_circle_mut(&mut img, (cx, cy - 14), 13, body_color);
+            // Floppy ears
+            draw_filled_circle_mut(&mut img, (cx - 13, cy - 10), 6, Rgba([150, 110, 70, 255]));
+            draw_filled_circle_mut(&mut img, (cx + 13, cy - 10), 6, Rgba([150, 110, 70, 255]));
+            // Snout
+            draw_filled_circle_mut(&mut img, (cx, cy - 10), 6, accent_color);
+            // Eyes
+            if is_blink_frame || pet.mood == Mood::Sleeping {
+                draw_filled_rect_mut(&mut img, Rect::at(cx - 7, cy - 17).of_size(4, 2), eye_color);
+                draw_filled_rect_mut(&mut img, Rect::at(cx + 3, cy - 17).of_size(4, 2), eye_color);
+            } else {
+                draw_filled_circle_mut(&mut img, (cx - 5, cy - 16), 3, eye_color);
+                draw_filled_circle_mut(&mut img, (cx + 5, cy - 16), 3, eye_color);
+                draw_filled_circle_mut(&mut img, (cx - 4, cy - 16), 1, Rgba([255, 255, 255, 255]));
+                draw_filled_circle_mut(&mut img, (cx + 6, cy - 16), 1, Rgba([255, 255, 255, 255]));
+            }
+            // Nose
+            draw_filled_circle_mut(&mut img, (cx, cy - 8), 3, Rgba([40, 40, 40, 255]));
+            // Tongue when happy
+            if pet.mood == Mood::Happy || pet.mood == Mood::Excited {
+                draw_filled_circle_mut(&mut img, (cx + 2, cy - 4), 3, Rgba([255, 120, 120, 255]));
+            }
+            // Tail — wagging
+            let wag = if blink % 4 < 2 { -4 } else { 4 };
+            draw_filled_circle_mut(&mut img, (cx + 18 + wag, cy - 8), 4, body_color);
+            draw_filled_circle_mut(&mut img, (cx + 22 + wag, cy - 14), 3, body_color);
+            // Feet
+            draw_filled_circle_mut(&mut img, (cx - 8, cy + 14), 4, body_color);
+            draw_filled_circle_mut(&mut img, (cx + 8, cy + 14), 4, body_color);
+        }
+        Species::Penguin => {
+            // Body — tall oval
+            draw_filled_circle_mut(&mut img, (cx, cy - 2), 16, body_color);
+            draw_filled_circle_mut(&mut img, (cx, cy + 6), 14, body_color);
+            // White belly
+            draw_filled_circle_mut(&mut img, (cx, cy + 2), 10, accent_color);
+            // Head
+            draw_filled_circle_mut(&mut img, (cx, cy - 16), 11, body_color);
+            // Eyes
+            if is_blink_frame || pet.mood == Mood::Sleeping {
+                draw_filled_rect_mut(&mut img, Rect::at(cx - 6, cy - 17).of_size(3, 2), Rgba([255, 255, 255, 255]));
+                draw_filled_rect_mut(&mut img, Rect::at(cx + 3, cy - 17).of_size(3, 2), Rgba([255, 255, 255, 255]));
+            } else {
+                draw_filled_circle_mut(&mut img, (cx - 4, cy - 17), 3, Rgba([255, 255, 255, 255]));
+                draw_filled_circle_mut(&mut img, (cx + 4, cy - 17), 3, Rgba([255, 255, 255, 255]));
+                draw_filled_circle_mut(&mut img, (cx - 4, cy - 17), 2, eye_color);
+                draw_filled_circle_mut(&mut img, (cx + 4, cy - 17), 2, eye_color);
+            }
+            // Beak
+            draw_filled_circle_mut(&mut img, (cx, cy - 12), 3, nose_color);
+            // Flippers
+            let flap = if pet.action == Action::Dancing { if blink % 4 < 2 { -3 } else { 3 } } else { 0 };
+            draw_filled_circle_mut(&mut img, (cx - 16, cy - 2 + flap), 5, body_color);
+            draw_filled_circle_mut(&mut img, (cx + 16, cy - 2 - flap), 5, body_color);
+            // Feet
+            draw_filled_circle_mut(&mut img, (cx - 6, cy + 16), 4, nose_color);
+            draw_filled_circle_mut(&mut img, (cx + 6, cy + 16), 4, nose_color);
+        }
+        Species::Ghost => {
+            // Floaty body — bobs up and down
+            let bob = if blink % 6 < 3 { -2 } else { 2 };
+            let gy = cy + bob;
+            // Body — rounded top, wavy bottom
+            draw_filled_circle_mut(&mut img, (cx, gy - 6), 18, body_color);
+            draw_filled_rect_mut(&mut img, Rect::at(cx - 18, gy - 6).of_size(36, 20), body_color);
+            // Wavy bottom
+            for i in 0..4 {
+                let wave = if (i + blink as i32 / 3) % 2 == 0 { 0 } else { 4 };
+                draw_filled_circle_mut(&mut img, (cx - 14 + i * 10, gy + 14 + wave), 5, body_color);
+            }
+            // Eyes
+            draw_filled_circle_mut(&mut img, (cx - 6, gy - 8), 4, eye_color);
+            draw_filled_circle_mut(&mut img, (cx + 6, gy - 8), 4, eye_color);
+            draw_filled_circle_mut(&mut img, (cx - 5, gy - 9), 2, Rgba([255, 255, 255, 200]));
+            draw_filled_circle_mut(&mut img, (cx + 7, gy - 9), 2, Rgba([255, 255, 255, 200]));
+            // Mouth
+            if pet.mood == Mood::Happy || pet.mood == Mood::Excited {
+                draw_filled_circle_mut(&mut img, (cx, gy - 2), 3, Rgba([40, 40, 60, 180]));
+            }
+        }
+    }
+
+    // Mood decorations
+    match pet.mood {
+        Mood::Happy | Mood::Excited => {
+            // Little hearts or stars floating
+            let sparkle_y = cy - 30 - (blink % 8) as i32;
+            if pet.mood == Mood::Excited {
+                draw_filled_circle_mut(&mut img, (cx + 20, sparkle_y), 2, Rgba([255, 215, 0, 255]));
+                draw_filled_circle_mut(&mut img, (cx - 18, sparkle_y + 5), 2, Rgba([255, 215, 0, 255]));
+                draw_filled_circle_mut(&mut img, (cx + 28, sparkle_y + 8), 1, Rgba([255, 215, 0, 255]));
+            } else {
+                draw_filled_circle_mut(&mut img, (cx + 22, sparkle_y), 3, Rgba([255, 100, 120, 200]));
+            }
+        }
+        Mood::Sleeping => {
+            // Zzz bubbles
+            let f = font_bold();
+            let z_x = cx + 20;
+            let z_y = cy - 30 - (blink % 6) as i32;
+            draw_text_mut(&mut img, Rgba([120, 120, 180, 200]), z_x, z_y, PxScale::from(14.0), &f, "z");
+            draw_text_mut(&mut img, Rgba([100, 100, 160, 180]), z_x + 8, z_y - 8, PxScale::from(12.0), &f, "z");
+            draw_text_mut(&mut img, Rgba([80, 80, 140, 150]), z_x + 14, z_y - 14, PxScale::from(10.0), &f, "z");
+        }
+        Mood::Hungry => {
+            // Sweat drop
+            draw_filled_circle_mut(&mut img, (cx + 14, cy - 26), 3, Rgba([100, 150, 255, 200]));
+            draw_filled_circle_mut(&mut img, (cx + 14, cy - 30), 2, Rgba([100, 150, 255, 180]));
+        }
+        Mood::Sad => {
+            // Tear drop
+            draw_filled_circle_mut(&mut img, (cx - 8, cy - 10), 2, Rgba([100, 150, 255, 220]));
+        }
+        _ => {}
+    }
+
+    // Action-specific decorations
+    if pet.action == Action::Typing {
+        // Little laptop/keyboard in front
+        draw_filled_rect_mut(&mut img, Rect::at(cx - 20, cy + 8).of_size(16, 10), Rgba([60, 60, 80, 255]));
+        draw_filled_rect_mut(&mut img, Rect::at(cx - 19, cy + 9).of_size(14, 6), Rgba([80, 120, 180, 255]));
+        // Blinking cursor
+        if blink % 4 < 2 {
+            draw_filled_rect_mut(&mut img, Rect::at(cx - 14, cy + 11).of_size(2, 3), Rgba([200, 255, 200, 255]));
+        }
+    }
+
+    if pet.action == Action::Eating {
+        // Food item
+        draw_filled_circle_mut(&mut img, (cx - 24, cy + 6), 4, Rgba([100, 200, 100, 255]));
+        draw_filled_circle_mut(&mut img, (cx - 24, cy + 3), 3, Rgba([80, 180, 80, 255]));
+    }
+
+    if pet.action == Action::Celebrating {
+        // Confetti!
+        for i in 0..6 {
+            let conf_x = cx - 30 + (i * 17 + blink as i32 * 3) % 80;
+            let conf_y = 5 + (i * 13 + blink as i32 * 2) % 30;
+            let colors = [
+                Rgba([255, 100, 100, 255]),
+                Rgba([100, 255, 100, 255]),
+                Rgba([100, 100, 255, 255]),
+                Rgba([255, 255, 100, 255]),
+                Rgba([255, 100, 255, 255]),
+                Rgba([100, 255, 255, 255]),
+            ];
+            draw_filled_rect_mut(&mut img, Rect::at(conf_x, conf_y).of_size(3, 3), colors[i as usize % 6]);
+        }
+    }
+
+    // Status text — right side
+    let status = pet.status();
+    let status_scale = PxScale::from(14.0);
+    draw_text_mut(
+        &mut img,
+        Rgba([100, 100, 130, 255]),
+        280, 8,
+        status_scale,
+        &f,
+        &status,
+    );
+
+    // Name + level
+    let name_str = format!("{}", pet.name);
+    draw_text_mut(
+        &mut img,
+        Rgba([180, 180, 210, 255]),
+        280, 26,
+        PxScale::from(16.0),
+        &fb,
+        &name_str,
+    );
+
+    // Stat bars on the right
+    let bar_x = 280_i32;
+    let bar_w = 100_i32;
+    let bar_h = 6;
+
+    // Happiness (green)
+    let hp = (pet.happiness as i32 * bar_w / 100).max(1);
+    draw_text_mut(&mut img, Rgba([80, 80, 100, 255]), bar_x, 44, PxScale::from(10.0), &f, "♡");
+    draw_filled_rect_mut(&mut img, Rect::at(bar_x + 12, 46).of_size(bar_w as u32, bar_h as u32), Rgba([25, 25, 40, 255]));
+    draw_filled_rect_mut(&mut img, Rect::at(bar_x + 12, 46).of_size(hp as u32, bar_h as u32), Rgba([80, 200, 80, 255]));
+
+    // Hunger (orange, fills up)
+    let hunger = (pet.hunger as i32 * bar_w / 100).max(0);
+    draw_text_mut(&mut img, Rgba([80, 80, 100, 255]), bar_x, 56, PxScale::from(10.0), &f, "◆");
+    draw_filled_rect_mut(&mut img, Rect::at(bar_x + 12, 58).of_size(bar_w as u32, bar_h as u32), Rgba([25, 25, 40, 255]));
+    draw_filled_rect_mut(&mut img, Rect::at(bar_x + 12, 58).of_size(hunger as u32, bar_h as u32), Rgba([200, 120, 40, 255]));
+
+    // XP bar
+    let xp_in_level = pet.xp % 100;
+    let xp_fill = (xp_in_level as i32 * bar_w / 100).max(0);
+    draw_text_mut(&mut img, Rgba([80, 80, 100, 255]), bar_x, 68, PxScale::from(10.0), &f, "★");
+    draw_filled_rect_mut(&mut img, Rect::at(bar_x + 12, 70).of_size(bar_w as u32, bar_h as u32), Rgba([25, 25, 40, 255]));
+    draw_filled_rect_mut(&mut img, Rect::at(bar_x + 12, 70).of_size(xp_fill as u32, bar_h as u32), Rgba([120, 100, 220, 255]));
+
+    // Info overlay text (timer, meeting, reviews) at top-right
+    if let Some(info) = info {
+        draw_text_mut(
+            &mut img,
+            Rgba([200, 200, 220, 255]),
+            280, 82,
+            PxScale::from(13.0),
+            &f,
+            info,
+        );
+    }
+
+    // Separator on left edge
+    draw_filled_rect_mut(
+        &mut img,
+        Rect::at(0, 8).of_size(1, height - 16),
+        Rgba([40, 40, 55, 255]),
+    );
 
     img
 }

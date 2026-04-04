@@ -611,6 +611,9 @@ fn start_daemon() {
     }
 
     info!("deckd shutting down");
+    if let Ok(p) = pet_state.lock() {
+        p.save();
+    }
     deck.set_brightness(0).ok();
     deck.clear_all_button_images().ok();
     deck.flush().ok();

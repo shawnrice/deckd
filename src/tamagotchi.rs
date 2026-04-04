@@ -1,5 +1,8 @@
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+use log::{error, info};
 
 /// A pixel pet that lives on the LCD strip.
 /// It reacts to your work habits — happy when you ship PRs,
@@ -337,6 +340,7 @@ impl Pet {
         self.action_duration_secs = 5;
         self.mood = Mood::Happy;
         self.check_level_up();
+        self.save();
     }
 
     /// Pet the pet (call on LCD touch)
@@ -345,6 +349,7 @@ impl Pet {
         self.xp += 2;
         self.last_pet = Instant::now();
         self.mood = Mood::Happy;
+        self.save();
     }
 
     /// PR was shipped — big reward
@@ -357,6 +362,7 @@ impl Pet {
         self.action_duration_secs = 8;
         self.mood = Mood::Excited;
         self.check_level_up();
+        self.save();
     }
 
     /// Review completed — small reward
@@ -436,6 +442,55 @@ impl Pet {
 
 pub type SharedPet = Arc<Mutex<Pet>>;
 
+fn save_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join(".config/deckd/pet.json")
+}
+
+impl Pet {
+    pub fn save(&self) {
+        let species = match self.species {
+            Species::Cat => "cat",
+            Species::Dog => "dog",
+            Species::Penguin => "penguin",
+            Species::Ghost => "ghost",
+        };
+        let json = format!(
+            r#"{{"name":"{}","species":"{}","energy":{},"happiness":{},"hunger":{},"xp":{},"level":{}}}"#,
+            self.name, species, self.energy, self.happiness, self.hunger, self.xp, self.level
+        );
+        if let Err(e) = std::fs::write(save_path(), json) {
+            error!("Failed to save pet: {}", e);
+        }
+    }
+
+    pub fn load_or_new(name: &str) -> Self {
+        let path = save_path();
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+                let species = match v["species"].as_str().unwrap_or("cat") {
+                    "dog" => Species::Dog,
+                    "penguin" => Species::Penguin,
+                    "ghost" => Species::Ghost,
+                    _ => Species::Cat,
+                };
+                let mut pet = Pet::new(v["name"].as_str().unwrap_or(name));
+                pet.species = species;
+                pet.energy = v["energy"].as_u64().unwrap_or(80) as u8;
+                pet.happiness = v["happiness"].as_u64().unwrap_or(70) as u8;
+                pet.hunger = v["hunger"].as_u64().unwrap_or(20) as u8;
+                pet.xp = v["xp"].as_u64().unwrap_or(0) as u32;
+                pet.level = v["level"].as_u64().unwrap_or(1) as u32;
+                info!("Pet loaded: {} (Lv.{} {})", pet.name, pet.level, v["species"].as_str().unwrap_or("cat"));
+                return pet;
+            }
+        }
+        info!("New pet created: {}", name);
+        Pet::new(name)
+    }
+}
+
 pub fn new_shared(name: &str) -> SharedPet {
-    Arc::new(Mutex::new(Pet::new(name)))
+    Arc::new(Mutex::new(Pet::load_or_new(name)))
 }
