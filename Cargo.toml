@@ -1,0 +1,23 @@
+[package]
+name = "deckd"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight Stream Deck daemon"
+
+[dependencies]
+elgato-streamdeck = "0.12.1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+image = "0.25"
+imageproc = "0.25"
+ab_glyph = "0.2"
+log = "0.4"
+env_logger = "0.11"
+signal-hook = "0.3"
+dirs = "6"
+btleplug = "0.12"
+libc = "0.2"
+serialport = "4"
+coreaudio-sys = { version = "0.2", default-features = false, features = ["audio_unit", "core_audio"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+uuid = "1"
