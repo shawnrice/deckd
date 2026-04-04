@@ -8,7 +8,7 @@ description = "A lightweight Stream Deck daemon"
 elgato-streamdeck = "0.12.1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-image = "0.25"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 imageproc = "0.25"
 ab_glyph = "0.2"
 log = "0.4"
