@@ -14,6 +14,8 @@ pub enum InputResult {
     ActionFired(Action),
     LcdDoubleTap(u8),
     TimerCommand(String),
+    /// Swipe direction: negative = right (previous page), positive = left (next page)
+    SwipePage(i8),
 }
 
 pub fn connect() -> Result<StreamDeck, Box<dyn std::error::Error>> {
@@ -56,7 +58,7 @@ fn handle_action(action: &Action) -> Option<InputResult> {
                     last_result = Some(r);
                 }
             }
-            return last_result;
+            last_result
         }
         Action::LightPreset { brightness, temp_k, group } => {
             let key = match group {
@@ -124,13 +126,12 @@ pub fn poll_and_dispatch(
                 if *pressed {
                     info!("Button {} pressed", i);
                     let key = i.to_string();
-                    if let Some(button) = buttons.get(&key) {
-                        if let Some(action) = &button.on_press {
-                            if let Some(result) = handle_action(action) {
-                                out = Some(result);
-                                break;
-                            }
-                        }
+                    if let Some(button) = buttons.get(&key)
+                        && let Some(action) = &button.on_press
+                        && let Some(result) = handle_action(action)
+                    {
+                        out = Some(result);
+                        break;
                     }
                 }
             }
@@ -143,13 +144,12 @@ pub fn poll_and_dispatch(
                 if *pressed {
                     info!("Encoder {} pressed", i);
                     let key = i.to_string();
-                    if let Some(encoder) = encoders.get(&key) {
-                        if let Some(action) = &encoder.on_press {
-                            if let Some(result) = handle_action(action) {
-                                out = Some(result);
-                                break;
-                            }
-                        }
+                    if let Some(encoder) = encoders.get(&key)
+                        && let Some(action) = &encoder.on_press
+                        && let Some(result) = handle_action(action)
+                    {
+                        out = Some(result);
+                        break;
                     }
                 }
             }
@@ -162,21 +162,17 @@ pub fn poll_and_dispatch(
                 if *amount != 0 {
                     let key = i.to_string();
                     debug!("Encoder {} twisted: {}", i, amount);
-                    if let Some(encoder) = encoders.get(&key) {
-                        let action = if *amount > 0 {
-                            &encoder.on_turn_cw
-                        } else {
-                            &encoder.on_turn_ccw
-                        };
-                        if let Some(action) = action {
-                            let mut result = handle_action(action);
-                            if let Some(InputResult::AudioCommand(cmd, _)) = result {
-                                result = Some(InputResult::AudioCommand(cmd, *amount));
-                            }
-                            if result.is_some() {
-                                out = result;
-                                break;
-                            }
+                    let action = encoders.get(&key).and_then(|enc| {
+                        if *amount > 0 { enc.on_turn_cw.as_ref() } else { enc.on_turn_ccw.as_ref() }
+                    });
+                    if let Some(action) = action {
+                        let mut result = handle_action(action);
+                        if let Some(InputResult::AudioCommand(cmd, _)) = result {
+                            result = Some(InputResult::AudioCommand(cmd, *amount));
+                        }
+                        if result.is_some() {
+                            out = result;
+                            break;
                         }
                     }
                 }
@@ -184,7 +180,7 @@ pub fn poll_and_dispatch(
             out
         }
 
-        StreamDeckInput::TouchScreenPress(x, y) => {
+        StreamDeckInput::TouchScreenPress(x, _y) => {
             // Map x to LCD segment (0-3), each segment is 200px
             let segment = (x / 200).min(3) as u8;
             let now = std::time::Instant::now();
@@ -209,8 +205,15 @@ pub fn poll_and_dispatch(
         }
 
         StreamDeckInput::TouchScreenSwipe(from, to) => {
-            info!("Touch swipe from {:?} to {:?}", from, to);
-            None
+            let dx = to.0 as i32 - from.0 as i32;
+            if dx.abs() > 100 {
+                // Swipe left (dx < 0) = next page, swipe right (dx > 0) = previous
+                let direction: i8 = if dx < 0 { 1 } else { -1 };
+                info!("LCD swipe {} (dx={})", if direction > 0 { "left→next" } else { "right→prev" }, dx);
+                Some(InputResult::SwipePage(direction))
+            } else {
+                None
+            }
         }
     };
 

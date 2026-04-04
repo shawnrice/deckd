@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use coreaudio_sys::*;
-use log::{info, warn};
+use log::info;
 
 // ── Device queries ──────────────────────────────────────────────
 
@@ -165,6 +165,7 @@ fn set_volume_scalar(device: AudioDeviceID, scope: AudioObjectPropertyScope, vol
 // ── Mute ────────────────────────────────────────────────────────
 
 /// Get input mute state
+#[allow(dead_code)]
 pub fn is_input_muted() -> bool {
     let device = match default_device(true) {
         Some(d) => d,
@@ -376,23 +377,6 @@ fn extract_json_field(json: &str, key: &str) -> Option<String> {
     Some(json[start..end].to_string())
 }
 
-fn current_device(device_type: &str) -> String {
-    Command::new("SwitchAudioSource")
-        .args(["-c", "-t", device_type])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
-}
-
-fn switch_device(device_type: &str, name: &str) {
-    Command::new("SwitchAudioSource")
-        .args(["-s", name, "-t", device_type])
-        .output()
-        .ok();
-}
-
 // ── CoreAudio device change listener ────────────────────────────
 
 /// Register CoreAudio listeners that set `flag` to true when audio devices
@@ -434,7 +418,8 @@ unsafe extern "C" fn audio_property_changed(
     client_data: *mut std::ffi::c_void,
 ) -> OSStatus {
     // Set the flag — main loop will notice and refresh
-    let flag = Arc::from_raw(client_data as *const AtomicBool);
+    // SAFETY: client_data is an Arc<AtomicBool> pointer created via Arc::into_raw
+    let flag = unsafe { Arc::from_raw(client_data as *const AtomicBool) };
     flag.store(true, Ordering::Relaxed);
     // Don't drop — we need to keep the Arc alive
     let _ = Arc::into_raw(flag);

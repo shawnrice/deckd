@@ -6,7 +6,7 @@ use elgato_streamdeck::images::ImageRect;
 use image::{DynamicImage, GenericImageView, Rgba, RgbaImage};
 use imageproc::drawing::{draw_filled_rect_mut, draw_text_mut};
 use imageproc::rect::Rect;
-use log::{error, info, warn};
+use log::{error, warn};
 
 use crate::config::{ButtonConfig, EncoderConfig};
 use crate::dashboard::DashboardState;
@@ -16,11 +16,17 @@ const FONT_DATA: &[u8] = include_bytes!("../assets/font.ttf");
 const FONT_BOLD_DATA: &[u8] = include_bytes!("../assets/font-bold.ttf");
 
 fn font() -> FontRef<'static> {
-    FontRef::try_from_slice(FONT_DATA).expect("Failed to load font")
+    FontRef::try_from_slice(FONT_DATA).unwrap_or_else(|e| {
+        error!("Failed to load font: {}, falling back to bold", e);
+        FontRef::try_from_slice(FONT_BOLD_DATA).expect("All embedded fonts are corrupt")
+    })
 }
 
 fn font_bold() -> FontRef<'static> {
-    FontRef::try_from_slice(FONT_BOLD_DATA).expect("Failed to load bold font")
+    FontRef::try_from_slice(FONT_BOLD_DATA).unwrap_or_else(|e| {
+        error!("Failed to load bold font: {}, falling back to regular", e);
+        FontRef::try_from_slice(FONT_DATA).expect("All embedded fonts are corrupt")
+    })
 }
 
 fn parse_hex(hex: &str) -> Rgba<u8> {
@@ -92,7 +98,7 @@ fn render_button(label: &str, icon_name: Option<&str>, size: u32, bg: Rgba<u8>, 
     let bar_height = 4_u32;
     draw_filled_rect_mut(
         &mut img,
-        Rect::at(margin, (size as i32 - margin - bar_height as i32))
+        Rect::at(margin, size as i32 - margin - bar_height as i32)
             .of_size(inner as u32, bar_height),
         accent,
     );
@@ -101,7 +107,7 @@ fn render_button(label: &str, icon_name: Option<&str>, size: u32, bg: Rgba<u8>, 
     let shadow = darken(bg, 0.3);
     draw_filled_rect_mut(
         &mut img,
-        Rect::at(margin, (size as i32 - margin - bar_height as i32 - 2))
+        Rect::at(margin, size as i32 - margin - bar_height as i32 - 2)
             .of_size(inner as u32, 2),
         shadow,
     );
@@ -114,12 +120,17 @@ fn render_button(label: &str, icon_name: Option<&str>, size: u32, bg: Rgba<u8>, 
             env!("CARGO_MANIFEST_DIR"),
             icon
         );
-        if let Ok(icon_img) = image::open(&icon_path) {
-            let icon_size = (size as f32 * 0.55) as u32;
-            let resized = icon_img.resize(icon_size, icon_size, image::imageops::FilterType::Lanczos3);
-            let ox = ((size - resized.width()) / 2) as i64;
-            let oy = (margin as u32 + 2) as i64;
-            image::imageops::overlay(&mut img, &resized.to_rgba8(), ox, oy);
+        match image::open(&icon_path) {
+            Ok(icon_img) => {
+                let icon_size = (size as f32 * 0.55) as u32;
+                let resized = icon_img.resize(icon_size, icon_size, image::imageops::FilterType::Lanczos3);
+                let ox = ((size - resized.width()) / 2) as i64;
+                let oy = (margin as u32 + 2) as i64;
+                image::imageops::overlay(&mut img, &resized.to_rgba8(), ox, oy);
+            }
+            Err(e) => {
+                warn!("Icon '{}' not found: {}, rendering text only", icon, e);
+            }
         }
     }
 
@@ -278,11 +289,11 @@ pub fn render_lcd_dashboard(
 ) {
     // Check for active notifications — render banner if any are fresh (< 5 seconds)
     let notification_duration = std::time::Duration::from_secs(5);
-    if let Some(notif) = dashboard.notifications.last() {
-        if notif.created.elapsed() < notification_duration {
-            render_notification_banner(deck, &notif.message, notif.created);
-            return;
-        }
+    if let Some(notif) = dashboard.notifications.last()
+        && notif.created.elapsed() < notification_duration
+    {
+        render_notification_banner(deck, &notif.message, notif.created);
+        return;
     }
 
     let seg_w = 200_u32;
@@ -345,7 +356,7 @@ pub fn render_lcd_dashboard(
             } else {
                 ("PRs", format!("{} open", dashboard.my_pr_count))
             };
-            let img = render_lcd_segment(&l, Some(&v), seg_w, strip_h);
+            let img = render_lcd_segment(l, Some(&v), seg_w, strip_h);
             write_lcd_segment(deck, 2, &img, seg_w);
         }
 
@@ -480,11 +491,8 @@ fn render_notification_banner(deck: &mut StreamDeck, message: &str, created: std
 
     // Write full strip
     let dyn_img = DynamicImage::ImageRgba8(img);
-    match ImageRect::from_image(dyn_img) {
-        Ok(rect) => {
-            deck.write_lcd(0, 0, &rect).ok();
-        }
-        Err(_) => {}
+    if let Ok(rect) = ImageRect::from_image(dyn_img) {
+        deck.write_lcd(0, 0, &rect).ok();
     }
 }
 

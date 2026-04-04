@@ -49,7 +49,7 @@ pub fn render_boot_frame(deck: &mut StreamDeck, progress: f32, status: &str) {
     // Progress bar background
     let bar_x = 20_i32;
     let bar_y = 55_i32;
-    let bar_w = (STRIP_W - 40) as u32;
+    let bar_w = STRIP_W - 40;
     let bar_h = 20_u32;
     draw_filled_rect_mut(&mut img, Rect::at(bar_x, bar_y).of_size(bar_w, bar_h), BAR_BG);
 

@@ -207,6 +207,11 @@ fn start_daemon() {
             .expect("Failed to register SIGTERM handler");
     }
 
+    // SIGHUP triggers config reload (same flag as UDP __reload)
+    let reload_flag = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&reload_flag))
+        .expect("Failed to register SIGHUP handler");
+
     let mut deck = match deck::connect() {
         Ok(d) => d,
         Err(e) => {
@@ -278,7 +283,6 @@ fn start_daemon() {
     let timer_state = timer::new_shared();
 
     // Start notification listener (localhost:9876 UDP)
-    let reload_flag = Arc::new(AtomicBool::new(false));
     notify::start_listener(Arc::clone(&dash_state), Arc::clone(&timer_state), Arc::clone(&reload_flag));
 
     // Audio device cycler (caches device list, single subprocess per switch)
@@ -294,11 +298,26 @@ fn start_daemon() {
     let mut current_page = cfg.start_page();
     let buttons = cfg.active_buttons(&current_page);
     render::render_buttons(&mut deck, buttons);
+
+    // Startup sound
+    soundboard::play_named("success");
     // LCD stays showing boot animation until BLE scan completes (or dashboard takes over)
 
     // Track when we last refreshed the LCD dashboard
     let mut last_lcd_refresh = Instant::now();
     let lcd_refresh_interval = std::time::Duration::from_secs(5);
+
+    // Page list for swipe navigation
+    let swipe_pages = ["main", "tools", "ship"];
+
+    // Track timer expiry to play sound once
+    let mut timer_was_expired = false;
+
+    // Track config file mtime for auto-reload
+    let mut last_config_mtime = std::fs::metadata(&config_path)
+        .and_then(|m| m.modified())
+        .ok();
+    let mut last_mtime_check = Instant::now();
 
     // Main loop
     let mut read_errors = 0u32;
@@ -372,7 +391,24 @@ fn start_daemon() {
                     }
                 }
                 deck::InputResult::LcdDoubleTap(segment) => {
-                    handle_lcd_double_tap(segment);
+                    handle_lcd_double_tap(segment, &dash_state);
+                }
+                deck::InputResult::SwipePage(direction) => {
+                    let current_idx = swipe_pages.iter().position(|&p| p == current_page);
+                    let new_page = match current_idx {
+                        Some(idx) => {
+                            let len = swipe_pages.len() as i32;
+                            let new_idx = ((idx as i32 + direction as i32) % len + len) % len;
+                            swipe_pages[new_idx as usize].to_string()
+                        }
+                        None => "main".to_string(), // Not in swipe list, go home
+                    };
+                    if new_page != current_page {
+                        info!("Swipe → page: {}", new_page);
+                        current_page = new_page;
+                        render_page(&mut deck, &cfg, &current_page);
+                        last_lcd_refresh = Instant::now() - lcd_refresh_interval;
+                    }
                 }
                 deck::InputResult::TimerCommand(cmd) => {
                     if let Ok(mut t) = timer_state.lock() {
@@ -416,6 +452,19 @@ fn start_daemon() {
             }
         }
 
+        // Check config file mtime every 2 seconds for auto-reload
+        if last_mtime_check.elapsed() >= std::time::Duration::from_secs(2) {
+            last_mtime_check = Instant::now();
+            let current_mtime = std::fs::metadata(&config_path)
+                .and_then(|m| m.modified())
+                .ok();
+            if current_mtime != last_config_mtime && current_mtime.is_some() {
+                info!("Config file changed on disk, triggering reload");
+                last_config_mtime = current_mtime;
+                reload_flag.store(true, Ordering::Relaxed);
+            }
+        }
+
         // Hot-reload config
         if reload_flag.swap(false, Ordering::Relaxed) {
             match config::load(&config_path) {
@@ -451,30 +500,30 @@ fn start_daemon() {
                 .map(|s| s.meeting_changed)
                 .unwrap_or(false);
 
-            if meeting_changed {
-                if let Ok(mut s) = dash_state.lock() {
-                    s.meeting_changed = false;
-                    let in_meeting = s.in_meeting;
-                    drop(s);
+            if meeting_changed
+                && let Ok(mut s) = dash_state.lock()
+            {
+                s.meeting_changed = false;
+                let in_meeting = s.in_meeting;
+                drop(s);
 
-                    if in_meeting && current_page == "main" {
-                        // Auto-enter meeting mode
-                        info!("Auto-entering meeting mode");
-                        // Set light presets
-                        handle_light_command(&mut all_lights, "preset:70:5000:keylights", &rt);
-                        handle_light_command(&mut all_lights, "preset:30:5000:desklights", &rt);
-                        current_page = "meeting".into();
-                        render_page(&mut deck, &cfg, &current_page);
-                        last_lcd_refresh = Instant::now() - lcd_refresh_interval;
-                    } else if !in_meeting && current_page == "meeting" {
-                        // Auto-exit meeting mode
-                        info!("Auto-exiting meeting mode");
-                        handle_light_command(&mut all_lights, "preset:50:4400:keylights", &rt);
-                        handle_light_command(&mut all_lights, "preset:50:4400:desklights", &rt);
-                        current_page = "main".into();
-                        render_page(&mut deck, &cfg, &current_page);
-                        last_lcd_refresh = Instant::now() - lcd_refresh_interval;
-                    }
+                if in_meeting && current_page == "main" {
+                    // Auto-enter meeting mode
+                    info!("Auto-entering meeting mode");
+                    // Set light presets
+                    handle_light_command(&mut all_lights, "preset:70:5000:keylights", &rt);
+                    handle_light_command(&mut all_lights, "preset:30:5000:desklights", &rt);
+                    current_page = "meeting".into();
+                    render_page(&mut deck, &cfg, &current_page);
+                    last_lcd_refresh = Instant::now() - lcd_refresh_interval;
+                } else if !in_meeting && current_page == "meeting" {
+                    // Auto-exit meeting mode
+                    info!("Auto-exiting meeting mode");
+                    handle_light_command(&mut all_lights, "preset:50:4400:keylights", &rt);
+                    handle_light_command(&mut all_lights, "preset:50:4400:desklights", &rt);
+                    current_page = "main".into();
+                    render_page(&mut deck, &cfg, &current_page);
+                    last_lcd_refresh = Instant::now() - lcd_refresh_interval;
                 }
             }
         }
@@ -490,6 +539,15 @@ fn start_daemon() {
         let timer_active = timer_state.lock().ok()
             .map(|t| t.is_running())
             .unwrap_or(false);
+
+        // Play sound when timer expires (once)
+        if let Ok(t) = timer_state.lock() {
+            let expired = t.is_expired();
+            if expired && !timer_was_expired {
+                soundboard::play_named("timer_done");
+            }
+            timer_was_expired = expired;
+        }
 
         let refresh_interval = if has_notification {
             std::time::Duration::from_millis(150)
@@ -651,38 +709,68 @@ fn handle_audio_command(
     }
 }
 
-fn handle_lcd_double_tap(segment: u8) {
-    let url = match segment {
-        0 => None, // Volume — no URL
-        1 => None, // Audio device — no URL
-        2 => Some("https://github.com/shawnrice/deckd/pulls?q=is%3Apr+is%3Aopen+review-requested%3A%40me"),
-        3 => Some("https://github.com/shawnrice/deckd/pulls?q=is%3Apr+is%3Aopen+author%3A%40me+review%3Aapproved"),
-        _ => None,
-    };
-    if let Some(url) = url {
-        info!("LCD double-tap segment {} → opening URL", segment);
-        std::process::Command::new("open").arg(url).spawn().ok();
+fn handle_lcd_double_tap(segment: u8, dash_state: &dashboard::SharedDashboard) {
+    match segment {
+        0 => {
+            // Toggle mic mute
+            info!("LCD double-tap segment 0 → toggling mic mute");
+            let now_muted = audio::toggle_input_mute();
+            dashboard::set_mic_muted(dash_state, now_muted);
+        }
+        1 => {
+            // Cycle output device (forward)
+            info!("LCD double-tap segment 1 → cycling output device");
+            // We can't access the cycler here, so use a shell command
+            std::process::Command::new("SwitchAudioSource")
+                .args(["-n"])
+                .spawn()
+                .ok();
+        }
+        2 | 3 => {
+            // Check if now-playing is showing on segments 2-3
+            let has_music = dash_state.lock().ok()
+                .map(|s| {
+                    s.now_playing_state == "playing"
+                        || (s.now_playing_state == "paused" && !s.now_playing_title.is_empty())
+                })
+                .unwrap_or(false);
+
+            if has_music {
+                info!("LCD double-tap segment {} → opening Spotify", segment);
+                std::process::Command::new("open")
+                    .arg("-a")
+                    .arg("Spotify")
+                    .spawn()
+                    .ok();
+            } else {
+                let url = if segment == 2 {
+                    "https://github.com/shawnrice/deckd/pulls?q=is%3Apr+is%3Aopen+review-requested%3A%40me"
+                } else {
+                    "https://github.com/shawnrice/deckd/pulls?q=is%3Apr+is%3Aopen+author%3A%40me+review%3Aapproved"
+                };
+                info!("LCD double-tap segment {} → opening URL", segment);
+                std::process::Command::new("open").arg(url).spawn().ok();
+            }
+        }
+        _ => {}
     }
 }
 
 fn apply_optimistic_update(state: &dashboard::SharedDashboard, action: &config::Action) {
-    match action {
-        config::Action::Shell { command } => {
-            if command.contains("output volume") && command.contains("+ 5") {
-                dashboard::nudge_volume(state, 5);
-            } else if command.contains("output volume") && command.contains("- 5") {
-                dashboard::nudge_volume(state, -5);
-            } else if command.contains("-m toggle -t input") {
-                // Mic mute toggle — flip current state
-                if let Ok(s) = state.lock() {
-                    let currently_muted = s.mic_muted;
-                    drop(s);
-                    dashboard::set_mic_muted(state, !currently_muted);
-                }
-            } else if command.contains("SwitchAudioSource -n") {
-                dashboard::mark_audio_changed(state);
+    if let config::Action::Shell { command } = action {
+        if command.contains("output volume") && command.contains("+ 5") {
+            dashboard::nudge_volume(state, 5);
+        } else if command.contains("output volume") && command.contains("- 5") {
+            dashboard::nudge_volume(state, -5);
+        } else if command.contains("-m toggle -t input") {
+            // Mic mute toggle — flip current state
+            if let Ok(s) = state.lock() {
+                let currently_muted = s.mic_muted;
+                drop(s);
+                dashboard::set_mic_muted(state, !currently_muted);
             }
+        } else if command.contains("SwitchAudioSource -n") {
+            dashboard::mark_audio_changed(state);
         }
-        _ => {}
     }
 }

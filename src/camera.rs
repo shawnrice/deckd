@@ -1,6 +1,6 @@
 use std::process::Command;
 
-use log::{error, info};
+use log::info;
 
 /// Camera state tracking
 #[derive(Debug, Clone)]
@@ -8,7 +8,9 @@ pub struct CameraState {
     pub zoom: i32,      // 100-400 (100 = 1x, 400 = 4x)
     pub pan: i32,       // -72000 to 72000
     pub tilt: i32,      // -72000 to 72000
+    #[allow(dead_code)]
     pub brightness: i32,
+    #[allow(dead_code)]
     pub contrast: i32,
     pub auto_focus: bool,
 }
@@ -26,6 +28,7 @@ impl CameraState {
     }
 
     /// Read current state from camera
+    #[allow(dead_code)]
     pub fn read_from_device() -> Self {
         let zoom = uvcc_get("absolute_zoom").unwrap_or(100);
         let pan_tilt = uvcc_get_pair("absolute_pan_tilt").unwrap_or((0, 0));
@@ -72,6 +75,7 @@ fn uvcc_set_pair(control: &str, a: i32, b: i32) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn uvcc_get(control: &str) -> Option<i32> {
     Command::new("uvcc")
         .args(["get", control])
@@ -81,6 +85,7 @@ fn uvcc_get(control: &str) -> Option<i32> {
         .and_then(|s| s.trim().parse().ok())
 }
 
+#[allow(dead_code)]
 fn uvcc_get_pair(control: &str) -> Option<(i32, i32)> {
     let output = Command::new("uvcc")
         .args(["get", control])

@@ -167,10 +167,10 @@ pub fn start_poller(state: SharedDashboard) {
 
 fn poll_audio(state: &SharedDashboard) {
     // Skip if an optimistic update is still fresh — avoids overwriting local state
-    if let Ok(s) = state.lock() {
-        if Instant::now() < s.audio_suppress_until {
-            return;
-        }
+    if let Ok(s) = state.lock()
+        && Instant::now() < s.audio_suppress_until
+    {
+        return;
     }
     let volume = Command::new("osascript")
         .arg("-e")
@@ -406,16 +406,16 @@ end try
 return "none||""#)
         .output();
 
-    if let Ok(o) = output {
-        if let Ok(text) = String::from_utf8(o.stdout) {
-            let parts: Vec<&str> = text.trim().splitn(3, '|').collect();
-            if parts.len() == 3 {
-                if let Ok(mut s) = state.lock() {
-                    s.now_playing_state = parts[0].to_string();
-                    s.now_playing_title = parts[1].to_string();
-                    s.now_playing_artist = parts[2].to_string();
-                }
-            }
+    if let Ok(o) = output
+        && let Ok(text) = String::from_utf8(o.stdout)
+    {
+        let parts: Vec<&str> = text.trim().splitn(3, '|').collect();
+        if parts.len() == 3
+            && let Ok(mut s) = state.lock()
+        {
+            s.now_playing_state = parts[0].to_string();
+            s.now_playing_title = parts[1].to_string();
+            s.now_playing_artist = parts[2].to_string();
         }
     }
 }
@@ -542,16 +542,16 @@ end tell
         meeting_title = item.to_string();
 
         // Try to extract minutes until meeting from the time
-        if let Some(paren_start) = item.find('(') {
-            if let Some(paren_end) = item.find(')') {
-                let time_str = &item[paren_start + 1..paren_end];
-                if let Some(dash) = time_str.find(" - ") {
-                    let start_time = &time_str[..dash].trim();
-                    // Parse HH:MM
-                    if let Some(mins) = parse_minutes_until(start_time) {
-                        meeting_mins = mins;
-                        meeting_title = item[..paren_start].trim().to_string();
-                    }
+        if let Some(paren_start) = item.find('(')
+            && let Some(paren_end) = item.find(')')
+        {
+            let time_str = &item[paren_start + 1..paren_end];
+            if let Some(dash) = time_str.find(" - ") {
+                let start_time = time_str[..dash].trim();
+                // Parse HH:MM
+                if let Some(mins) = parse_minutes_until(start_time) {
+                    meeting_mins = mins;
+                    meeting_title = item[..paren_start].trim().to_string();
                 }
             }
         }

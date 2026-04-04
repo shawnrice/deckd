@@ -2,7 +2,7 @@ use std::io::Write as IoWrite;
 use std::net::UdpSocket;
 use std::time::Duration;
 
-use log::{error, info, warn};
+use log::{info, warn};
 
 // ── Protocol (shared across all transports) ─────────────────────
 
@@ -11,6 +11,7 @@ const TAG_POWER: u8 = 0x81;
 const TAG_CCT: u8 = 0x87;
 
 // GL1 UDP protocol
+#[allow(dead_code)]
 const GL1_PORT: u16 = 5052;
 
 fn checksum(bytes: &[u8]) -> u8 {
@@ -52,6 +53,7 @@ fn pl81_cmd_cct(brightness: u8, color_temp_byte: u8) -> Vec<u8> {
     vec![PL81_PREFIX, 0x02, 0x03, 0x01, brightness, color_temp_byte, cs[0], cs[1]]
 }
 
+#[allow(dead_code)]
 fn pl81_cmd_power(on: bool) -> Vec<u8> {
     let state = if on { 0x01 } else { 0x02 };
     let payload = [PL81_PREFIX, 0x06, 0x01, state];
@@ -98,6 +100,7 @@ fn gl1_cmd_cct(brightness: u8, color_temp_k: u16) -> Vec<u8> {
     vec![0x80, 0x05, 0x03, 0x02, brightness, temp_byte, chk]
 }
 
+#[allow(dead_code)]
 fn gl1_handshake(local_ip: &str) -> Vec<u8> {
     // IP is sent as ASCII hex representation of each byte of the IP string
     let ip_as_ascii_hex: Vec<u8> = local_ip
@@ -140,9 +143,8 @@ impl LightState {
     }
 
     pub fn adjust_temp(&mut self, delta: i16) {
-        self.color_temp_raw =
-            (self.color_temp_raw as i16 + (delta / 100).max(1).min(1) * if delta > 0 { 1 } else { -1 })
-                .clamp(0x20, 0x38) as u8;
+        let raw_step: i16 = if delta > 0 { 1 } else { -1 };
+        self.color_temp_raw = (self.color_temp_raw as i16 + raw_step).clamp(0x20, 0x38) as u8;
         self.color_temp_k = (self.color_temp_k as i16 + delta).clamp(2900, 7000) as u16;
     }
 
@@ -162,6 +164,7 @@ pub struct Light {
     state: LightState,
 }
 
+#[allow(dead_code)]
 enum Transport {
     Ble {
         peripheral: btleplug::platform::Peripheral,
@@ -180,13 +183,13 @@ enum Transport {
 impl Light {
     /// Re-send GL1 handshake if it's been more than 10 seconds since the last one
     fn ensure_gl1_alive(&mut self) {
-        if let Transport::Udp { socket, broadcast_addr, handshake, last_heartbeat } = &mut self.transport {
-            if last_heartbeat.elapsed() > Duration::from_secs(10) {
-                for _ in 0..2 {
-                    socket.send_to(handshake, broadcast_addr.as_str()).ok();
-                }
-                *last_heartbeat = std::time::Instant::now();
+        if let Transport::Udp { socket, broadcast_addr, handshake, last_heartbeat } = &mut self.transport
+            && last_heartbeat.elapsed() > Duration::from_secs(10)
+        {
+            for _ in 0..2 {
+                socket.send_to(handshake, broadcast_addr.as_str()).ok();
             }
+            *last_heartbeat = std::time::Instant::now();
         }
     }
 
@@ -351,7 +354,7 @@ async fn discover_ble_lights() -> Result<Vec<Light>, String> {
         let is_neewer = name_upper.starts_with("NEEWER")
             || name_upper.starts_with("NW-")
             || name_upper.starts_with("NW ")
-            || props.services.iter().any(|s| *s == NEEWER_SERVICE);
+            || props.services.contains(&NEEWER_SERVICE);
 
         if !is_neewer {
             continue;
@@ -458,6 +461,7 @@ fn udp_write(socket: &UdpSocket, addr: &str, cmd: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn get_local_ip() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("8.8.8.8:80").ok()?;
@@ -465,6 +469,7 @@ fn get_local_ip() -> Option<String> {
     Some(addr.ip().to_string())
 }
 
+#[allow(dead_code)]
 fn discover_gl1_lights() -> Vec<Light> {
     let local_ip = match get_local_ip() {
         Some(ip) => ip,

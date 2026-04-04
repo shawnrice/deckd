@@ -37,7 +37,6 @@ impl Timer {
         if let Some(start) = self.started_at {
             if self.paused {
                 // Resume: shift started_at forward by the pause duration
-                let pause_duration = start.elapsed() - self.paused_elapsed;
                 self.started_at = Some(Instant::now() - self.paused_elapsed);
                 self.paused = false;
             } else {

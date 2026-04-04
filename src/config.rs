@@ -52,6 +52,7 @@ pub struct ButtonConfig {
     pub icon: Option<String>,       // Path to image file
     pub icon_name: Option<String>,  // Built-in icon name (e.g. "terminal", "volume", "rocket")
     pub on_press: Option<Action>,
+    #[allow(dead_code)]
     pub on_long_press: Option<Action>,
     pub bg_color: Option<String>,
     pub fg_color: Option<String>,
