@@ -10,6 +10,7 @@ use log::{error, warn};
 
 use crate::config::{ButtonConfig, EncoderConfig};
 use crate::dashboard::DashboardState;
+use crate::tamagotchi::SharedPet;
 use crate::timer::SharedTimer;
 
 const FONT_DATA: &[u8] = include_bytes!("../assets/font.ttf");
@@ -286,6 +287,7 @@ pub fn render_lcd_dashboard(
     encoders: &HashMap<String, EncoderConfig>,
     dashboard: &DashboardState,
     timer: &SharedTimer,
+    pet: &SharedPet,
 ) {
     // Check for active notifications — render banner if any are fresh (< 5 seconds)
     let notification_duration = std::time::Duration::from_secs(5);
@@ -348,16 +350,19 @@ pub fn render_lcd_dashboard(
         write_lcd_segment(deck, 2, &left, seg_w);
         write_lcd_segment(deck, 3, &right, seg_w);
     } else {
-        // Segment 2: Reviews / PRs
+        // Segment 2: Reviews > Pet
         {
             let reviews = dashboard.review_requests;
-            let (l, v) = if reviews > 0 {
-                ("Reviews", format!("{} waiting", reviews))
+            if reviews > 0 {
+                let img = render_lcd_segment("Reviews", Some(&format!("{} waiting", reviews)), seg_w, strip_h);
+                write_lcd_segment(deck, 2, &img, seg_w);
+            } else if let Ok(p) = pet.lock() {
+                let img = render_pet_segment(&p, seg_w, strip_h);
+                write_lcd_segment(deck, 2, &img, seg_w);
             } else {
-                ("PRs", format!("{} open", dashboard.my_pr_count))
-            };
-            let img = render_lcd_segment(l, Some(&v), seg_w, strip_h);
-            write_lcd_segment(deck, 2, &img, seg_w);
+                let img = render_lcd_segment("PRs", Some(&format!("{} open", dashboard.my_pr_count)), seg_w, strip_h);
+                write_lcd_segment(deck, 2, &img, seg_w);
+            }
         }
 
         // Segment 3: Timer > Meeting > Merge > Issues
@@ -494,6 +499,63 @@ fn render_notification_banner(deck: &mut StreamDeck, message: &str, created: std
     if let Ok(rect) = ImageRect::from_image(dyn_img) {
         deck.write_lcd(0, 0, &rect).ok();
     }
+}
+
+fn render_pet_segment(pet: &crate::tamagotchi::Pet, width: u32, height: u32) -> RgbaImage {
+    let bg = Rgba([12, 12, 20, 255]);
+    let mut img = RgbaImage::from_pixel(width, height, bg);
+
+    let fb = font_bold();
+    let f = font();
+
+    // Separator
+    draw_filled_rect_mut(
+        &mut img,
+        Rect::at(width as i32 - 1, 8).of_size(1, height - 16),
+        Rgba([40, 40, 55, 255]),
+    );
+
+    // Pet face — large, centered
+    let face = pet.sprite();
+    let face_scale = PxScale::from(28.0);
+    let face_tw = text_width(face, &fb, face_scale);
+    let face_x = ((width as f32 - face_tw) / 2.0).max(4.0) as i32;
+
+    // Color based on mood
+    let face_color = match pet.mood {
+        crate::tamagotchi::Mood::Happy => Rgba([100, 255, 100, 255]),
+        crate::tamagotchi::Mood::Excited => Rgba([255, 215, 0, 255]),
+        crate::tamagotchi::Mood::Sad => Rgba([100, 100, 200, 255]),
+        crate::tamagotchi::Mood::Hungry => Rgba([255, 140, 60, 255]),
+        crate::tamagotchi::Mood::Sleeping => Rgba([120, 120, 160, 255]),
+        crate::tamagotchi::Mood::Coding => Rgba([76, 201, 240, 255]),
+        crate::tamagotchi::Mood::Neutral => Rgba([180, 180, 200, 255]),
+    };
+    draw_text_mut(&mut img, face_color, face_x, 10, face_scale, &fb, face);
+
+    // Status line — small
+    let status = pet.status();
+    let status_scale = PxScale::from(14.0);
+    let status_tw = text_width(&status, &f, status_scale);
+    let status_x = ((width as f32 - status_tw) / 2.0).max(4.0) as i32;
+    draw_text_mut(&mut img, Rgba([120, 120, 150, 255]), status_x, 50, status_scale, &f, &status);
+
+    // Stat bars — tiny at the bottom
+    let bar_y = 72;
+    let bar_w = (width - 16) as i32;
+    let bar_h = 4;
+
+    // Happiness bar (green)
+    let hp_filled = (pet.happiness as i32 * bar_w / 100).max(1);
+    draw_filled_rect_mut(&mut img, Rect::at(8, bar_y).of_size(bar_w as u32, bar_h as u32), Rgba([30, 30, 45, 255]));
+    draw_filled_rect_mut(&mut img, Rect::at(8, bar_y).of_size(hp_filled as u32, bar_h as u32), Rgba([80, 200, 80, 255]));
+
+    // Hunger bar (orange) — fills up as hunger increases
+    let hunger_filled = (pet.hunger as i32 * bar_w / 100).max(0);
+    draw_filled_rect_mut(&mut img, Rect::at(8, bar_y + 8).of_size(bar_w as u32, bar_h as u32), Rgba([30, 30, 45, 255]));
+    draw_filled_rect_mut(&mut img, Rect::at(8, bar_y + 8).of_size(hunger_filled as u32, bar_h as u32), Rgba([200, 120, 40, 255]));
+
+    img
 }
 
 fn truncate(s: &str, max: usize) -> String {

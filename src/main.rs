@@ -6,9 +6,11 @@ mod config;
 mod dashboard;
 mod deck;
 mod lights;
+mod gcal;
 mod notify;
 mod render;
 mod soundboard;
+mod tamagotchi;
 mod timer;
 
 use std::sync::Arc;
@@ -47,6 +49,17 @@ fn main() {
                 soundboard::play_named_sync(name);
                 return;
             }
+            "auth" => {
+                let service = args.get(2).map(|s| s.as_str()).unwrap_or("");
+                match service {
+                    "google" => gcal::authorize(),
+                    _ => {
+                        eprintln!("Usage: deckd auth google");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
             "reload" => {
                 send_udp("__reload");
                 println!("Reload signal sent.");
@@ -70,6 +83,7 @@ fn main() {
                 println!("  deckd timer [toggle|start_25|start_5|start_10|stop]");
                 println!("  deckd sound <name>       Play a sound from assets/sounds/");
                 println!("  deckd sounds             List available sounds");
+                println!("  deckd auth google        Authorize Google Calendar access");
                 println!("  deckd reload             Reload config without restarting");
                 println!("  deckd help               Show this help");
                 return;
@@ -282,6 +296,9 @@ fn start_daemon() {
     // Timer
     let timer_state = timer::new_shared();
 
+    // Tamagotchi pet
+    let pet_state = tamagotchi::new_shared("deckchi");
+
     // Start notification listener (localhost:9876 UDP)
     notify::start_listener(Arc::clone(&dash_state), Arc::clone(&timer_state), Arc::clone(&reload_flag));
 
@@ -375,7 +392,7 @@ fn start_daemon() {
                     if current_page == "main" {
                         if let Ok(dash) = dash_state.lock() {
                             let encoders = cfg.active_encoders(&current_page);
-                            render::render_lcd_dashboard(&mut deck, encoders, &dash, &timer_state);
+                            render::render_lcd_dashboard(&mut deck, encoders, &dash, &timer_state, &pet_state);
                         }
                         last_lcd_refresh = Instant::now();
                     }
@@ -385,12 +402,18 @@ fn start_daemon() {
                         apply_optimistic_update(&dash_state, action);
                         if let Ok(dash) = dash_state.lock() {
                             let encoders = cfg.active_encoders(&current_page);
-                            render::render_lcd_dashboard(&mut deck, encoders, &dash, &timer_state);
+                            render::render_lcd_dashboard(&mut deck, encoders, &dash, &timer_state, &pet_state);
                         }
                         last_lcd_refresh = Instant::now();
                     }
                 }
                 deck::InputResult::LcdDoubleTap(segment) => {
+                    // Pet the pet on segment 2 single/double tap
+                    if segment == 2 {
+                        if let Ok(mut p) = pet_state.lock() {
+                            p.pet();
+                        }
+                    }
                     handle_lcd_double_tap(segment, &dash_state);
                 }
                 deck::InputResult::SwipePage(direction) => {
@@ -446,10 +469,15 @@ fn start_daemon() {
             if current_page == "main" {
                 if let Ok(dash) = dash_state.lock() {
                     let encoders = cfg.active_encoders(&current_page);
-                    render::render_lcd_dashboard(&mut deck, encoders, &dash, &timer_state);
+                    render::render_lcd_dashboard(&mut deck, encoders, &dash, &timer_state, &pet_state);
                 }
                 last_lcd_refresh = Instant::now();
             }
+        }
+
+        // Tick the pet
+        if let Ok(mut p) = pet_state.lock() {
+            p.tick();
         }
 
         // Check config file mtime every 2 seconds for auto-reload
@@ -560,12 +588,23 @@ fn start_daemon() {
         if current_page == "main" && last_lcd_refresh.elapsed() >= refresh_interval {
             // Clean up stale notifications
             if let Ok(mut s) = dash_state.lock() {
+                // Feed the pet based on GitHub events
+                if let Ok(mut p) = pet_state.lock() {
+                    for notif in &s.notifications {
+                        if notif.message.contains("ready to merge") {
+                            p.ship_pr();
+                        } else if notif.message.contains("approved") {
+                            p.feed();
+                        }
+                    }
+                    p.pending_reviews(s.review_requests);
+                }
                 s.notifications.retain(|n| n.created.elapsed() < std::time::Duration::from_secs(6));
             }
 
             if let Ok(dash) = dash_state.lock() {
                 let encoders = cfg.active_encoders(&current_page);
-                render::render_lcd_dashboard(&mut deck, encoders, &dash, &timer_state);
+                render::render_lcd_dashboard(&mut deck, encoders, &dash, &timer_state, &pet_state);
             }
             last_lcd_refresh = Instant::now();
         }

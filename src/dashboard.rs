@@ -134,7 +134,7 @@ pub fn start_poller(state: SharedDashboard) {
         // Immediate poll
         poll_audio(&state);
         poll_github(&state);
-        poll_meeting(&state);
+        poll_calendar(&state);
 
         let mut last_audio = Instant::now();
         let mut last_github = Instant::now();
@@ -150,9 +150,9 @@ pub fn start_poller(state: SharedDashboard) {
                 last_audio = Instant::now();
             }
 
-            // Meeting: poll every 60 seconds
+            // Calendar: poll every 60 seconds via Google Calendar API (no UI, no focus stealing)
             if last_meeting.elapsed() >= Duration::from_secs(60) {
-                poll_meeting(&state);
+                poll_calendar(&state);
                 last_meeting = Instant::now();
             }
 
@@ -480,112 +480,25 @@ end tell"#)
     }
 }
 
-fn poll_meeting(state: &SharedDashboard) {
-    // Query MeetingBar's dropdown menu for next meeting
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(r#"
-tell application "System Events"
-    tell process "MeetingBar"
-        set statusItem to menu bar item 1 of menu bar 2
-        click statusItem
-        delay 0.3
-        set menuItems to menu items of menu 1 of statusItem
-        set output to ""
-        repeat with mi in menuItems
-            try
-                set t to title of mi
-                if t is not "" then set output to output & t & "|"
-            end try
-        end repeat
-        key code 53
-        return output
-    end tell
-end tell
-"#)
-        .output();
+fn poll_calendar(state: &SharedDashboard) {
+    if !crate::gcal::is_configured() {
+        return;
+    }
 
-    let menu_text = match output {
-        Ok(o) if o.status.success() => {
-            String::from_utf8(o.stdout).unwrap_or_default().trim().to_string()
-        }
-        _ => return,
-    };
-
-    // Parse: items are separated by |
-    // Format: "Today (Fri, 3 Apr):|Meeting Title (HH:MM - HH:MM)|..."
-    // or "Nothing for today"
-    let items: Vec<&str> = menu_text.split('|').collect();
-
-    let mut meeting_title = "—".to_string();
-    let mut meeting_mins: i32 = -1;
-
-    for item in &items {
-        let item = item.trim();
-        if item.contains("Nothing for") || item.is_empty() {
-            continue;
-        }
-        // Skip header items and action items
-        if item.starts_with("Today")
-            || item.starts_with("Create")
-            || item.starts_with("Quick")
-            || item.starts_with("What's")
-            || item.starts_with("Rate")
-            || item.starts_with("Preferences")
-            || item.starts_with("Quit")
-        {
-            continue;
-        }
-
-        // This should be a meeting title, possibly with time in parentheses
-        // e.g. "Standup (10:00 - 10:15)" or just "Standup"
-        meeting_title = item.to_string();
-
-        // Try to extract minutes until meeting from the time
-        if let Some(paren_start) = item.find('(')
-            && let Some(paren_end) = item.find(')')
-        {
-            let time_str = &item[paren_start + 1..paren_end];
-            if let Some(dash) = time_str.find(" - ") {
-                let start_time = time_str[..dash].trim();
-                // Parse HH:MM
-                if let Some(mins) = parse_minutes_until(start_time) {
-                    meeting_mins = mins;
-                    meeting_title = item[..paren_start].trim().to_string();
+    match crate::gcal::next_events(3) {
+        Ok(events) => {
+            if let Ok(mut s) = state.lock() {
+                if let Some((title, mins)) = events.first() {
+                    s.next_meeting = title.clone();
+                    s.next_meeting_mins = *mins;
+                } else {
+                    s.next_meeting = "—".into();
+                    s.next_meeting_mins = -1;
                 }
             }
         }
-        break; // Take the first meeting
+        Err(e) => {
+            debug!("Calendar poll failed: {}", e);
+        }
     }
-
-    if let Ok(mut s) = state.lock() {
-        s.next_meeting = meeting_title;
-        s.next_meeting_mins = meeting_mins;
-    }
-}
-
-fn parse_minutes_until(time_str: &str) -> Option<i32> {
-    let parts: Vec<&str> = time_str.split(':').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let hour: u32 = parts[0].parse().ok()?;
-    let min: u32 = parts[1].parse().ok()?;
-
-    let now = Command::new("date")
-        .args(["+%H:%M"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())?;
-    let now = now.trim();
-    let now_parts: Vec<&str> = now.split(':').collect();
-    if now_parts.len() != 2 {
-        return None;
-    }
-    let now_h: i32 = now_parts[0].parse().ok()?;
-    let now_m: i32 = now_parts[1].parse().ok()?;
-
-    let target = hour as i32 * 60 + min as i32;
-    let current = now_h * 60 + now_m;
-    Some(target - current)
 }
