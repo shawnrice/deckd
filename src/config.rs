@@ -15,6 +15,9 @@ pub struct Config {
     /// GitHub repo for dashboard (e.g. "shawnrice/deckd")
     pub github_repo: Option<String>,
 
+    /// Camera vendor:product ID (e.g. "046d:0944"). Auto-detects if not set.
+    pub camera: Option<String>,
+
     #[serde(default)]
     pub monitoring: MonitoringConfig,
 

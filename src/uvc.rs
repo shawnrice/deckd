@@ -29,6 +29,63 @@ const PU_CONTRAST: u8 = 0x03;
 
 const TIMEOUT: Duration = Duration::from_millis(1000);
 
+/// List all UVC cameras connected to the system
+pub fn list_cameras() {
+    let devices = match rusb::devices() {
+        Ok(d) => d,
+        Err(e) => {
+            println!("USB enumeration failed: {}", e);
+            return;
+        }
+    };
+
+    let mut found = false;
+    for device in devices.iter() {
+        let config = match device.active_config_descriptor() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let is_uvc = config.interfaces().any(|iface| {
+            iface
+                .descriptors()
+                .any(|desc| desc.class_code() == 14 && desc.sub_class_code() == 1)
+        });
+
+        if !is_uvc {
+            continue;
+        }
+
+        let desc = match device.device_descriptor() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let handle = device.open().ok();
+        let product = handle
+            .as_ref()
+            .and_then(|h| h.read_product_string_ascii(&desc).ok())
+            .unwrap_or_else(|| "(unknown)".into());
+        let manufacturer = handle
+            .as_ref()
+            .and_then(|h| h.read_manufacturer_string_ascii(&desc).ok())
+            .unwrap_or_default();
+
+        println!(
+            "  {:04x}:{:04x}  {} {}",
+            desc.vendor_id(),
+            desc.product_id(),
+            manufacturer,
+            product,
+        );
+        found = true;
+    }
+
+    if !found {
+        println!("  No UVC cameras found");
+    }
+}
+
 // ── Camera handle ───────────────────────────────────────────────
 
 pub struct Camera {

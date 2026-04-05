@@ -51,6 +51,13 @@ fn main() {
                 soundboard::play_named_sync(name);
                 return;
             }
+            "cameras" => {
+                println!("UVC cameras:");
+                uvc::list_cameras();
+                println!("\nTo use a specific camera, add to config.toml:");
+                println!("  camera = \"vid:pid\"");
+                return;
+            }
             "feed" => {
                 send_udp("__pet:feed");
                 println!("Fed the pet!");
@@ -90,6 +97,7 @@ fn main() {
                 println!("  deckd timer [toggle|start_25|start_5|start_10|stop]");
                 println!("  deckd sound <name>       Play a sound from assets/sounds/");
                 println!("  deckd sounds             List available sounds");
+                println!("  deckd cameras             List connected UVC cameras");
                 println!("  deckd auth google        Authorize Google Calendar access");
                 println!("  deckd reload             Reload config without restarting");
                 println!("  deckd help               Show this help");
@@ -298,7 +306,7 @@ fn start_daemon() {
     dashboard::start_poller(Arc::clone(&dash_state), cfg.github_repo.clone(), cfg.monitoring.clone());
 
     // Camera state
-    let mut cam_state = camera::CameraState::new();
+    let mut cam_state = camera::CameraState::new(cfg.camera.clone());
 
     // Timer
     let timer_state = timer::new_shared();
