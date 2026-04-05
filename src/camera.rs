@@ -159,6 +159,44 @@ pub fn toggle_auto_exposure(state: &mut CameraState) -> Result<(), String> {
     })
 }
 
+pub fn set_fov_wide(state: &mut CameraState) -> Result<(), String> {
+    info!("Camera FOV: 90° wide");
+    with_camera(state.camera_id(), |c| c.set_fov(0))
+}
+
+pub fn set_fov_medium(state: &mut CameraState) -> Result<(), String> {
+    info!("Camera FOV: 78° medium");
+    with_camera(state.camera_id(), |c| c.set_fov(1))
+}
+
+pub fn set_fov_narrow(state: &mut CameraState) -> Result<(), String> {
+    info!("Camera FOV: 65° narrow");
+    with_camera(state.camera_id(), |c| c.set_fov(2))
+}
+
+pub fn cycle_fov(state: &mut CameraState) -> Result<(), String> {
+    with_camera(state.camera_id(), |c| {
+        let current = c.get_fov().unwrap_or(0);
+        let next = (current + 1) % 3;
+        let label = match next {
+            0 => "90° wide",
+            1 => "78° medium",
+            _ => "65° narrow",
+        };
+        info!("Camera FOV: {}", label);
+        c.set_fov(next)
+    })
+}
+
+pub fn toggle_rightlight(state: &mut CameraState) -> Result<(), String> {
+    with_camera(state.camera_id(), |c| {
+        let current = c.get_rightlight().unwrap_or(0);
+        let next = if current != 0 { 0 } else { 1 };
+        info!("Camera RightLight: {}", if next != 0 { "on" } else { "off" });
+        c.set_rightlight(next)
+    })
+}
+
 pub fn toggle_autofocus(state: &mut CameraState) -> Result<(), String> {
     state.auto_focus = !state.auto_focus;
     info!("Camera autofocus: {}", if state.auto_focus { "on" } else { "off" });

@@ -35,6 +35,14 @@ mod consts {
     pub const PU_SHARPNESS: u8 = 0x08;
     pub const PU_WHITE_BALANCE_TEMP: u8 = 0x0A;
     pub const PU_WHITE_BALANCE_AUTO: u8 = 0x0B;
+
+    // Logitech Extension Unit: Video Pipe V3 (BRIO / MX Brio)
+    // GUID: 49E40215-F434-47fe-B158-0E885023E51B
+    pub const LOGI_XU_COLOR_BOOST: u8 = 0x01;
+    pub const LOGI_XU_RIGHTLIGHT: u8 = 0x04;  // HDR / low-light adaptation
+    pub const LOGI_XU_FOV: u8 = 0x05;         // 0x00=90°, 0x01=78°, 0x02=65°
+    pub const LOGI_XU_FW_ZOOM: u8 = 0x06;
+    pub const LOGI_XU_DUAL_ISO: u8 = 0x07;
 }
 use consts::*;
 
@@ -109,11 +117,18 @@ pub fn find_cameras() -> Vec<CameraInfo> {
 
 // ── Camera handle ───────────────────────────────────────────────
 
+// Logitech Video Pipe V3 GUID (little-endian mixed format as it appears in USB descriptors)
+const LOGI_VIDEO_PIPE_V3_GUID: [u8; 16] = [
+    0x15, 0x02, 0xE4, 0x49, 0x34, 0xF4, 0xFE, 0x47,
+    0xB1, 0x58, 0x0E, 0x88, 0x50, 0x23, 0xE5, 0x1B,
+];
+
 pub struct Camera {
     handle: DeviceHandle<GlobalContext>,
     interface: u8,
     camera_terminal_id: u8,
     processing_unit_id: u8,
+    logi_xu_id: Option<u8>, // Logitech Extension Unit ID (if present)
 }
 
 #[allow(dead_code)]
@@ -168,15 +183,15 @@ impl Camera {
             .map_err(|e| format!("USB config: {}", e))?;
 
         let mut interface_num = 0u8;
-        let mut camera_terminal_id = 1u8; // default fallback
-        let mut processing_unit_id = 2u8; // default fallback
+        let mut camera_terminal_id = 1u8;
+        let mut processing_unit_id = 2u8;
+        let mut logi_xu_id: Option<u8> = None;
 
         for iface in config.interfaces() {
             for desc in iface.descriptors() {
                 if desc.class_code() == 14 && desc.sub_class_code() == 1 {
                     interface_num = desc.interface_number();
 
-                    // Parse UVC class-specific descriptors to find unit/terminal IDs
                     let extra = desc.extra();
                     let mut pos = 0;
                     while pos + 3 < extra.len() {
@@ -188,12 +203,10 @@ impl Camera {
                         let desc_subtype = extra[pos + 2];
 
                         if desc_type == 0x24 {
-                            // CS_INTERFACE
                             match desc_subtype {
                                 0x02 => {
-                                    // INPUT_TERMINAL
+                                    // INPUT_TERMINAL (ITT_CAMERA)
                                     if len >= 8 && extra[pos + 4] == 0x01 && extra[pos + 5] == 0x02 {
-                                        // ITT_CAMERA
                                         camera_terminal_id = extra[pos + 3];
                                     }
                                 }
@@ -201,6 +214,17 @@ impl Camera {
                                     // PROCESSING_UNIT
                                     if len >= 8 {
                                         processing_unit_id = extra[pos + 3];
+                                    }
+                                }
+                                0x06 => {
+                                    // EXTENSION_UNIT — check GUID
+                                    if len >= 24 {
+                                        let unit_id = extra[pos + 3];
+                                        let guid = &extra[pos + 4..pos + 20];
+                                        if guid == LOGI_VIDEO_PIPE_V3_GUID {
+                                            logi_xu_id = Some(unit_id);
+                                            info!("Found Logitech Video Pipe V3 XU: unit={}", unit_id);
+                                        }
                                     }
                                 }
                                 _ => {}
@@ -215,8 +239,9 @@ impl Camera {
 
         let dev_desc = device.device_descriptor().map_err(|e| format!("USB descriptor: {}", e))?;
         info!(
-            "UVC camera opened: {:04x}:{:04x} interface={} CT={} PU={}",
-            dev_desc.vendor_id(), dev_desc.product_id(), interface_num, camera_terminal_id, processing_unit_id
+            "UVC camera opened: {:04x}:{:04x} interface={} CT={} PU={} XU={:?}",
+            dev_desc.vendor_id(), dev_desc.product_id(), interface_num,
+            camera_terminal_id, processing_unit_id, logi_xu_id
         );
 
         Ok(Camera {
@@ -224,6 +249,7 @@ impl Camera {
             interface: interface_num,
             camera_terminal_id,
             processing_unit_id,
+            logi_xu_id,
         })
     }
 
@@ -322,6 +348,39 @@ impl Camera {
             i16::from_le_bytes(min_buf) as i32,
             i16::from_le_bytes(max_buf) as i32,
         ))
+    }
+
+    // ── Logitech Extension Unit controls ────────────────────────
+
+    /// Check if this camera has Logitech extension controls
+    pub fn has_logitech_xu(&self) -> bool {
+        self.logi_xu_id.is_some()
+    }
+
+    /// Set Field of View: 0=90° wide, 1=78° medium, 2=65° narrow
+    pub fn set_fov(&self, fov: u8) -> Result<(), String> {
+        let xu = self.logi_xu_id.ok_or("No Logitech XU on this camera")?;
+        self.control_set(LOGI_XU_FOV, xu, &[fov.clamp(0, 2)])
+    }
+
+    pub fn get_fov(&self) -> Result<u8, String> {
+        let xu = self.logi_xu_id.ok_or("No Logitech XU on this camera")?;
+        let mut buf = [0u8; 1];
+        self.control_get(LOGI_XU_FOV, xu, &mut buf)?;
+        Ok(buf[0])
+    }
+
+    /// Set RightLight mode (HDR / adaptive exposure)
+    pub fn set_rightlight(&self, mode: u8) -> Result<(), String> {
+        let xu = self.logi_xu_id.ok_or("No Logitech XU on this camera")?;
+        self.control_set(LOGI_XU_RIGHTLIGHT, xu, &[mode])
+    }
+
+    pub fn get_rightlight(&self) -> Result<u8, String> {
+        let xu = self.logi_xu_id.ok_or("No Logitech XU on this camera")?;
+        let mut buf = [0u8; 1];
+        self.control_get(LOGI_XU_RIGHTLIGHT, xu, &mut buf)?;
+        Ok(buf[0])
     }
 
     // ── Low-level control transfers ──────────────────────────────

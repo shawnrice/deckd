@@ -846,6 +846,11 @@ fn handle_camera_command(state: &mut camera::CameraState, cmd: &str) {
         "wb_down" => camera::adjust_white_balance(state, -200),
         "wb_auto" => camera::toggle_auto_white_balance(state),
         "ae_auto" => camera::toggle_auto_exposure(state),
+        "fov_wide" => camera::set_fov_wide(state),
+        "fov_medium" => camera::set_fov_medium(state),
+        "fov_narrow" => camera::set_fov_narrow(state),
+        "fov_cycle" => camera::cycle_fov(state),
+        "rightlight" => camera::toggle_rightlight(state),
         other => {
             warn!("Unknown camera command: {}", other);
             Ok(())
