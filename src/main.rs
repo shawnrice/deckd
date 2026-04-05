@@ -76,6 +76,63 @@ fn main() {
                 println!("Reload signal sent.");
                 return;
             }
+            "start" => {
+                let plist = plist_path();
+                if !plist.exists() {
+                    eprintln!("Service not installed. Run `deckd install` first.");
+                    std::process::exit(1);
+                }
+                std::process::Command::new("launchctl")
+                    .args(["start", LABEL])
+                    .status()
+                    .ok();
+                println!("Started.");
+                return;
+            }
+            "stop" => {
+                // Unload to fully stop (KeepAlive would restart on plain stop)
+                let plist = plist_path();
+                if plist.exists() {
+                    std::process::Command::new("launchctl")
+                        .args(["unload", plist.to_str().unwrap()])
+                        .status()
+                        .ok();
+                }
+                // Also kill any running instance
+                std::process::Command::new("pkill")
+                    .args(["-f", "deckd"])
+                    .status()
+                    .ok();
+                println!("Stopped.");
+                return;
+            }
+            "dev" => {
+                // Stop the service, run debug build, restart service on exit
+                let plist = plist_path();
+                let had_service = plist.exists();
+                if had_service {
+                    println!("Stopping service...");
+                    std::process::Command::new("launchctl")
+                        .args(["unload", plist.to_str().unwrap()])
+                        .status()
+                        .ok();
+                    std::process::Command::new("pkill")
+                        .args(["-f", "target/release/deckd"])
+                        .status()
+                        .ok();
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                println!("Running in dev mode... (Ctrl-C to stop)");
+                start_daemon();
+                if had_service {
+                    println!("Restarting service...");
+                    std::process::Command::new("launchctl")
+                        .args(["load", plist.to_str().unwrap()])
+                        .status()
+                        .ok();
+                }
+                return;
+            }
             "install" => {
                 install_service();
                 return;
@@ -90,6 +147,9 @@ fn main() {
                 println!("  deckd                    Start the daemon");
                 println!("  deckd install            Install as launchd service (auto-start)");
                 println!("  deckd uninstall          Remove launchd service");
+                println!("  deckd start              Start the launchd service");
+                println!("  deckd stop               Stop the service and kill deckd");
+                println!("  deckd dev                Stop service, run debug build, restart on exit");
                 println!("  deckd notify <message>   Show notification on LCD");
                 println!("  deckd timer [toggle|start_25|start_5|start_10|stop]");
                 println!("  deckd sound <name>       Play a sound from assets/sounds/");
@@ -141,10 +201,7 @@ r#"<?xml version="1.0" encoding="UTF-8"?>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
+    <true/>
     <key>StandardOutPath</key>
     <string>/tmp/deckd.stdout.log</string>
     <key>StandardErrorPath</key>
@@ -771,9 +828,16 @@ fn start_daemon() {
 
 fn render_page(deck: &mut elgato_streamdeck::StreamDeck, cfg: &config::Config, page: &str) {
     let buttons = cfg.active_buttons(page);
-    let encoders = cfg.active_encoders(page);
     render::render_buttons(deck, buttons);
-    render::render_lcd_strip(deck, encoders);
+    // LCD strip is rendered by the main loop's refresh cycle
+    // (dashboard, pet, monitor, or boot animation depending on page/state)
+    // Only render static encoder labels for pages that don't have live LCD content
+    if page != "main" && page != "monitor" {
+        let encoders = cfg.active_encoders(page);
+        if !encoders.is_empty() {
+            render::render_lcd_strip(deck, encoders);
+        }
+    }
 }
 
 fn handle_light_command(
