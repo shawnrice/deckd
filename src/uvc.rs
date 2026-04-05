@@ -29,17 +29,26 @@ const PU_CONTRAST: u8 = 0x03;
 
 const TIMEOUT: Duration = Duration::from_millis(1000);
 
-/// List all UVC cameras connected to the system
-pub fn list_cameras() {
+pub struct CameraInfo {
+    pub vid: u16,
+    pub pid: u16,
+    pub name: String,
+}
+
+impl CameraInfo {
+    pub fn id_string(&self) -> String {
+        format!("{:04x}:{:04x}", self.vid, self.pid)
+    }
+}
+
+/// Find all UVC cameras connected to the system
+pub fn find_cameras() -> Vec<CameraInfo> {
     let devices = match rusb::devices() {
         Ok(d) => d,
-        Err(e) => {
-            println!("USB enumeration failed: {}", e);
-            return;
-        }
+        Err(_) => return Vec::new(),
     };
 
-    let mut found = false;
+    let mut cameras = Vec::new();
     for device in devices.iter() {
         let config = match device.active_config_descriptor() {
             Ok(c) => c,
@@ -71,19 +80,20 @@ pub fn list_cameras() {
             .and_then(|h| h.read_manufacturer_string_ascii(&desc).ok())
             .unwrap_or_default();
 
-        println!(
-            "  {:04x}:{:04x}  {} {}",
-            desc.vendor_id(),
-            desc.product_id(),
-            manufacturer,
-            product,
-        );
-        found = true;
+        let name = if manufacturer.is_empty() {
+            product
+        } else {
+            format!("{} {}", manufacturer, product)
+        };
+
+        cameras.push(CameraInfo {
+            vid: desc.vendor_id(),
+            pid: desc.product_id(),
+            name,
+        });
     }
 
-    if !found {
-        println!("  No UVC cameras found");
-    }
+    cameras
 }
 
 // ── Camera handle ───────────────────────────────────────────────

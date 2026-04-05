@@ -52,10 +52,7 @@ fn main() {
                 return;
             }
             "cameras" => {
-                println!("UVC cameras:");
-                uvc::list_cameras();
-                println!("\nTo use a specific camera, add to config.toml:");
-                println!("  camera = \"vid:pid\"");
+                setup_camera();
                 return;
             }
             "feed" => {
@@ -203,6 +200,88 @@ fn uninstall_service() {
 
     std::fs::remove_file(&plist).expect("remove plist");
     println!("Service uninstalled.");
+}
+
+fn setup_camera() {
+    let cameras = uvc::find_cameras();
+
+    if cameras.is_empty() {
+        println!("No UVC cameras found.");
+        return;
+    }
+
+    let chosen = if cameras.len() == 1 {
+        println!("Found camera: {} ({})", cameras[0].name, cameras[0].id_string());
+        &cameras[0]
+    } else {
+        println!("Found {} cameras:\n", cameras.len());
+        for (i, cam) in cameras.iter().enumerate() {
+            println!("  [{}] {} ({})", i + 1, cam.name, cam.id_string());
+        }
+        print!("\nChoose camera [1-{}]: ", cameras.len());
+        std::io::Write::flush(&mut std::io::stdout()).ok();
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok();
+        let choice: usize = match input.trim().parse::<usize>() {
+            Ok(n) if n >= 1 && n <= cameras.len() => n - 1,
+            _ => {
+                println!("Invalid choice.");
+                return;
+            }
+        };
+        &cameras[choice]
+    };
+
+    let config_path = config::resolve_config_path();
+    let id = chosen.id_string();
+
+    match std::fs::read_to_string(&config_path) {
+        Ok(content) => {
+            let new_content = if content.contains("camera =") || content.contains("camera=") {
+                // Replace existing camera line
+                let mut result = String::new();
+                for line in content.lines() {
+                    if line.trim_start().starts_with("camera") && line.contains('=') {
+                        result.push_str(&format!("camera = \"{}\"", id));
+                    } else {
+                        result.push_str(line);
+                    }
+                    result.push('\n');
+                }
+                result
+            } else {
+                // Insert after default_page or at the top of the file
+                let mut result = String::new();
+                let mut inserted = false;
+                for line in content.lines() {
+                    result.push_str(line);
+                    result.push('\n');
+                    if !inserted && (line.starts_with("default_page") || line.starts_with("github_repo")) {
+                        result.push_str(&format!("camera = \"{}\"\n", id));
+                        inserted = true;
+                    }
+                }
+                if !inserted {
+                    result.push_str(&format!("camera = \"{}\"\n", id));
+                }
+                result
+            };
+
+            if let Err(e) = std::fs::write(&config_path, new_content) {
+                eprintln!("Failed to write config: {}", e);
+                return;
+            }
+        }
+        Err(_) => {
+            eprintln!("Config file not found at {}", config_path.display());
+            eprintln!("Add this to your config.toml:");
+            eprintln!("  camera = \"{}\"", id);
+            return;
+        }
+    }
+
+    println!("Saved camera = \"{}\" to {}", id, config_path.display());
 }
 
 fn send_udp(msg: &str) {
