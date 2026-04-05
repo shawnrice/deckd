@@ -6,6 +6,11 @@ use std::path::PathBuf;
 pub struct Config {
     pub brightness: Option<u8>,
     pub default_page: Option<String>,
+    pub pet_name: Option<String>,
+
+    /// Pages where the pet always shows on the LCD
+    #[serde(default)]
+    pub pet_pages: Vec<String>,
 
     #[serde(default)]
     pub output_devices: Vec<AudioDevice>,

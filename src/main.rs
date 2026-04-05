@@ -49,6 +49,11 @@ fn main() {
                 soundboard::play_named_sync(name);
                 return;
             }
+            "feed" => {
+                send_udp("__pet:feed");
+                println!("Fed the pet!");
+                return;
+            }
             "auth" => {
                 let service = args.get(2).map(|s| s.as_str()).unwrap_or("");
                 match service {
@@ -297,10 +302,11 @@ fn start_daemon() {
     let timer_state = timer::new_shared();
 
     // Tamagotchi pet
-    let pet_state = tamagotchi::new_shared("deckchi");
+    let pet_name = cfg.pet_name.as_deref().unwrap_or("deckchi");
+    let pet_state = tamagotchi::new_shared(pet_name);
 
     // Start notification listener (localhost:9876 UDP)
-    notify::start_listener(Arc::clone(&dash_state), Arc::clone(&timer_state), Arc::clone(&reload_flag));
+    notify::start_listener(Arc::clone(&dash_state), Arc::clone(&timer_state), Arc::clone(&pet_state), Arc::clone(&reload_flag));
 
     // Audio device cycler (caches device list, single subprocess per switch)
     let mut audio_cycler = audio::DeviceCycler::new(&cfg.output_devices, &cfg.input_devices);
@@ -408,13 +414,15 @@ fn start_daemon() {
                     }
                 }
                 deck::InputResult::LcdDoubleTap(segment) => {
-                    // Pet the pet on segment 2 single/double tap
-                    if segment == 2 {
+                    let is_pet_pg = cfg.pet_pages.iter().any(|p| p == &current_page);
+                    if is_pet_pg {
+                        // On pet pages, any tap pets the pet
                         if let Ok(mut p) = pet_state.lock() {
                             p.pet();
                         }
+                    } else if current_page == "main" {
+                        handle_lcd_double_tap(segment, &dash_state);
                     }
-                    handle_lcd_double_tap(segment, &dash_state);
                 }
                 deck::InputResult::SwipePage(direction) => {
                     let current_idx = swipe_pages.iter().position(|&p| p == current_page);
@@ -577,24 +585,32 @@ fn start_daemon() {
             timer_was_expired = expired;
         }
 
+        let is_pet_page = cfg.pet_pages.iter().any(|p| p == &current_page);
+        let pet_animating = pet_state.lock().ok()
+            .map(|p| p.action != crate::tamagotchi::Action::Idle && p.action != crate::tamagotchi::Action::Napping)
+            .unwrap_or(false);
+
         let refresh_interval = if has_notification {
             std::time::Duration::from_millis(150)
         } else if timer_active {
-            std::time::Duration::from_millis(500) // Update timer every 500ms
+            std::time::Duration::from_millis(500)
+        } else if pet_animating || is_pet_page {
+            std::time::Duration::from_millis(400) // Smooth pet animation
         } else {
             lcd_refresh_interval
         };
 
-        if current_page == "main" && last_lcd_refresh.elapsed() >= refresh_interval {
-            // Clean up stale notifications
+        if last_lcd_refresh.elapsed() >= refresh_interval {
+            // Clean up stale notifications + feed pet from GitHub events
             if let Ok(mut s) = dash_state.lock() {
-                // Feed the pet based on GitHub events
                 if let Ok(mut p) = pet_state.lock() {
                     for notif in &s.notifications {
                         if notif.message.contains("ready to merge") {
                             p.ship_pr();
                         } else if notif.message.contains("approved") {
                             p.feed();
+                        } else if notif.message.contains("Review completed") {
+                            p.complete_review();
                         }
                     }
                     p.pending_reviews(s.review_requests);
@@ -602,9 +618,16 @@ fn start_daemon() {
                 s.notifications.retain(|n| n.created.elapsed() < std::time::Duration::from_secs(6));
             }
 
-            if let Ok(dash) = dash_state.lock() {
-                let encoders = cfg.active_encoders(&current_page);
-                render::render_lcd_dashboard(&mut deck, encoders, &dash, &timer_state, &pet_state);
+            if current_page == "main" {
+                if let Ok(dash) = dash_state.lock() {
+                    let encoders = cfg.active_encoders(&current_page);
+                    render::render_lcd_dashboard(&mut deck, encoders, &dash, &timer_state, &pet_state);
+                }
+            } else if is_pet_page {
+                // Full-width pet scene on configured pages
+                if let Ok(p) = pet_state.lock() {
+                    render::render_pet_lcd(&mut deck, &p, 800, 100);
+                }
             }
             last_lcd_refresh = Instant::now();
         }

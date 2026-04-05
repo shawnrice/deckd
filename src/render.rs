@@ -489,6 +489,22 @@ fn render_notification_banner(deck: &mut StreamDeck, message: &str, created: std
     }
 }
 
+/// Full-width pet scene for dedicated pet pages (800x100)
+pub fn render_pet_lcd(
+    deck: &mut StreamDeck,
+    pet: &crate::tamagotchi::Pet,
+    width: u32,
+    height: u32,
+) {
+    let img = render_pet_wide(pet, None, width, height);
+    // Write as 4 segments
+    let seg_w = 200;
+    for i in 0..4u8 {
+        let seg = img.view(i as u32 * seg_w, 0, seg_w, height).to_image();
+        write_lcd_segment(deck, i, &seg, seg_w);
+    }
+}
+
 #[allow(dead_code)]
 fn render_pet_segment_old(pet: &crate::tamagotchi::Pet, width: u32, height: u32) -> RgbaImage {
     let bg = Rgba([12, 12, 20, 255]);
@@ -540,7 +556,7 @@ fn render_pet_segment_old(pet: &crate::tamagotchi::Pet, width: u32, height: u32)
     draw_filled_rect_mut(&mut img, Rect::at(8, bar_y).of_size(hp_filled as u32, bar_h as u32), Rgba([80, 200, 80, 255]));
 
     // Hunger bar (orange) — fills up as hunger increases
-    let hunger_filled = (pet.hunger as i32 * bar_w / 100).max(0);
+    let hunger_filled = (pet.hunger as i32 * bar_w / 100).max(1);
     draw_filled_rect_mut(&mut img, Rect::at(8, bar_y + 8).of_size(bar_w as u32, bar_h as u32), Rgba([30, 30, 45, 255]));
     draw_filled_rect_mut(&mut img, Rect::at(8, bar_y + 8).of_size(hunger_filled as u32, bar_h as u32), Rgba([200, 120, 40, 255]));
 
@@ -577,8 +593,10 @@ fn render_pet_wide(
             let cycle = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_millis() / 500) as i32;
-            80 + ((cycle % 8) - 4).abs() * 30 // walks back and forth
+                .as_millis() / 400) as i32;
+            let range = (width as i32 / 2) - 40; // use most of the available width
+            let center = width as i32 / 4;
+            center + ((cycle % 16) - 8).abs() * range / 8
         }
         Action::Dancing => {
             let cycle = (std::time::SystemTime::now()
@@ -855,14 +873,14 @@ fn render_pet_wide(
     draw_filled_rect_mut(&mut img, Rect::at(bar_x + 12, 46).of_size(hp as u32, bar_h as u32), Rgba([80, 200, 80, 255]));
 
     // Hunger (orange, fills up)
-    let hunger = (pet.hunger as i32 * bar_w / 100).max(0);
+    let hunger = (pet.hunger as i32 * bar_w / 100).max(1);
     draw_text_mut(&mut img, Rgba([80, 80, 100, 255]), bar_x, 56, PxScale::from(10.0), &f, "◆");
     draw_filled_rect_mut(&mut img, Rect::at(bar_x + 12, 58).of_size(bar_w as u32, bar_h as u32), Rgba([25, 25, 40, 255]));
     draw_filled_rect_mut(&mut img, Rect::at(bar_x + 12, 58).of_size(hunger as u32, bar_h as u32), Rgba([200, 120, 40, 255]));
 
     // XP bar
     let xp_in_level = pet.xp % 100;
-    let xp_fill = (xp_in_level as i32 * bar_w / 100).max(0);
+    let xp_fill = (xp_in_level as i32 * bar_w / 100).max(1);
     draw_text_mut(&mut img, Rgba([80, 80, 100, 255]), bar_x, 68, PxScale::from(10.0), &f, "★");
     draw_filled_rect_mut(&mut img, Rect::at(bar_x + 12, 70).of_size(bar_w as u32, bar_h as u32), Rgba([25, 25, 40, 255]));
     draw_filled_rect_mut(&mut img, Rect::at(bar_x + 12, 70).of_size(xp_fill as u32, bar_h as u32), Rgba([120, 100, 220, 255]));

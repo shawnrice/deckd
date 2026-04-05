@@ -328,6 +328,19 @@ fn poll_github(state: &SharedDashboard) {
             });
         }
 
+        if review_requests < s.review_requests && s.review_requests > 0 {
+            let completed = s.review_requests - review_requests;
+            let msg = if completed == 1 {
+                "Review completed!".into()
+            } else {
+                format!("{} reviews completed!", completed)
+            };
+            s.notifications.push(Notification {
+                message: msg,
+                created: Instant::now(),
+            });
+        }
+
         if mergeable > s.mergeable_count && s.mergeable_count > 0 {
             let delta = mergeable - s.mergeable_count;
             let msg = if delta == 1 {

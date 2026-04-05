@@ -7,6 +7,7 @@ use std::time::Instant;
 use log::{error, info};
 
 use crate::dashboard::{Notification, SharedDashboard};
+use crate::tamagotchi::SharedPet;
 use crate::timer::SharedTimer;
 
 const LISTEN_PORT: u16 = 9876;
@@ -21,7 +22,7 @@ const LISTEN_PORT: u16 = 9876;
 ///
 /// Or from a shell script:
 ///   echo "Deploy finished" > /dev/udp/localhost/9876
-pub fn start_listener(dashboard: SharedDashboard, timer: SharedTimer, reload_flag: Arc<AtomicBool>) {
+pub fn start_listener(dashboard: SharedDashboard, timer: SharedTimer, pet: SharedPet, reload_flag: Arc<AtomicBool>) {
     thread::spawn(move || {
         let socket = match UdpSocket::bind(format!("127.0.0.1:{}", LISTEN_PORT)) {
             Ok(s) => {
@@ -44,7 +45,17 @@ pub fn start_listener(dashboard: SharedDashboard, timer: SharedTimer, reload_fla
                             continue;
                         }
 
-                        if msg == "__reload" {
+                        if let Some(cmd) = msg.strip_prefix("__pet:") {
+                            info!("Pet command via UDP: {}", cmd);
+                            if let Ok(mut p) = pet.lock() {
+                                match cmd {
+                                    "feed" => p.feed(),
+                                    "pet" => p.pet(),
+                                    "ship" => p.ship_pr(),
+                                    _ => {}
+                                }
+                            }
+                        } else if msg == "__reload" {
                             info!("Reload requested via UDP");
                             reload_flag.store(true, Ordering::Relaxed);
                         } else if let Some(cmd) = msg.strip_prefix("__timer:") {
