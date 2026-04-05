@@ -665,11 +665,13 @@ fn poll_sysmon(state: &SharedDashboard, monitoring: &MonitoringConfig, boot_time
         let uptime = sysmon::poll_uptime();
 
         if let Ok(mut s) = state.lock() {
-            // Notify on high CPU load (skip first 60s after boot to avoid wake spike)
+            // Notify on high CPU load (>80% of cores, skip first 60s for wake spike)
+            let ncpu = sysmon::cpu_count() as f32;
+            let cpu_threshold = ncpu * 0.8;
             if let Some(load) = cpu {
-                if load > 4.0
+                if load > cpu_threshold
                     && boot_time.elapsed() > Duration::from_secs(60)
-                    && s.cpu_load.map(|prev| prev <= 4.0).unwrap_or(true)
+                    && s.cpu_load.map(|prev| prev <= cpu_threshold).unwrap_or(true)
                 {
                     s.notifications.push(Notification {
                         message: format!("High CPU load: {:.1}", load),

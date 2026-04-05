@@ -14,6 +14,17 @@ pub struct SystemStats {
     pub uptime_hours: Option<u32>,
 }
 
+/// Get number of CPU cores
+pub fn cpu_count() -> u32 {
+    Command::new("sysctl")
+        .args(["-n", "hw.ncpu"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(8)
+}
+
 /// Collect CPU load average (1-minute) via sysctl
 pub fn poll_cpu_load() -> Option<f32> {
     let output = Command::new("sysctl")
