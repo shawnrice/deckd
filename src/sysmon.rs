@@ -4,6 +4,7 @@ use log::debug;
 
 /// System monitoring stats, all optional depending on config
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub struct SystemStats {
     pub cpu_load: Option<f32>,
     pub memory_percent: Option<u8>,

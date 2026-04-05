@@ -3,29 +3,25 @@
 
 use std::time::Duration;
 
-use log::{info, warn};
+use log::info;
 use rusb::{DeviceHandle, GlobalContext};
 
-// ── UVC Constants ───────────────────────────────────────────────
-
-// Request types
-const SET_CUR: u8 = 0x01;
-const GET_CUR: u8 = 0x81;
-
-// bmRequestType
-const REQ_TYPE_SET: u8 = 0x21; // host→device, class, interface
-const REQ_TYPE_GET: u8 = 0xA1; // device→host, class, interface
-
-// Camera Terminal control selectors (UVC 1.1 spec, Table A-12)
-const CT_AE_MODE: u8 = 0x02;
-const CT_FOCUS_ABSOLUTE: u8 = 0x06;
-const CT_FOCUS_AUTO: u8 = 0x08;
-const CT_ZOOM_ABSOLUTE: u8 = 0x0B;
-const CT_PANTILT_ABSOLUTE: u8 = 0x0D;
-
-// Processing Unit control selectors (UVC 1.1 spec, Table A-14)
-const PU_BRIGHTNESS: u8 = 0x02;
-const PU_CONTRAST: u8 = 0x03;
+// ── UVC Constants (spec Table A-12, A-14) ───────────────────────
+#[allow(dead_code)]
+mod consts {
+    pub const SET_CUR: u8 = 0x01;
+    pub const GET_CUR: u8 = 0x81;
+    pub const REQ_TYPE_SET: u8 = 0x21;
+    pub const REQ_TYPE_GET: u8 = 0xA1;
+    pub const CT_AE_MODE: u8 = 0x02;
+    pub const CT_FOCUS_ABSOLUTE: u8 = 0x06;
+    pub const CT_FOCUS_AUTO: u8 = 0x08;
+    pub const CT_ZOOM_ABSOLUTE: u8 = 0x0B;
+    pub const CT_PANTILT_ABSOLUTE: u8 = 0x0D;
+    pub const PU_BRIGHTNESS: u8 = 0x02;
+    pub const PU_CONTRAST: u8 = 0x03;
+}
+use consts::*;
 
 const TIMEOUT: Duration = Duration::from_millis(1000);
 
@@ -105,6 +101,7 @@ pub struct Camera {
     processing_unit_id: u8,
 }
 
+#[allow(dead_code)]
 impl Camera {
     /// Open a UVC camera by vendor/product ID.
     /// Parses the UVC descriptor to find terminal/unit IDs.

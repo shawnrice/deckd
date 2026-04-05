@@ -3,7 +3,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use log::{error, info};
+use log::info;
 use serde_json::Value;
 
 // OAuth client credentials — using gcalcli's public client ID

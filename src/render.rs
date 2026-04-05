@@ -284,7 +284,7 @@ pub fn render_lcd_strip(deck: &mut StreamDeck, encoders: &HashMap<String, Encode
 /// Render the LCD strip with live dashboard data
 pub fn render_lcd_dashboard(
     deck: &mut StreamDeck,
-    encoders: &HashMap<String, EncoderConfig>,
+    _encoders: &HashMap<String, EncoderConfig>,
     dashboard: &DashboardState,
     timer: &SharedTimer,
     pet: &SharedPet,
@@ -777,7 +777,7 @@ fn render_pet_wide(
     height: u32,
 ) -> RgbaImage {
     use crate::tamagotchi::{Action, Mood, Species};
-    use imageproc::drawing::{draw_filled_circle_mut, draw_hollow_circle_mut};
+    use imageproc::drawing::draw_filled_circle_mut;
 
     let bg = Rgba([10, 10, 22, 255]);
     let mut img = RgbaImage::from_pixel(width, height, bg);
@@ -793,7 +793,7 @@ fn render_pet_wide(
     );
 
     // Pet position — moves based on action
-    let frame = pet.sprite().len() as i32; // use sprite len as frame proxy
+    let _frame = pet.sprite().len() as i32; // use sprite len as frame proxy
     let base_x = match pet.action {
         Action::Walking => {
             let cycle = (std::time::SystemTime::now()

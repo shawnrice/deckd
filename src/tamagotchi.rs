@@ -35,6 +35,7 @@ pub enum Species {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 pub enum Mood {
     Happy,
     Neutral,
