@@ -1113,6 +1113,47 @@ fn render_pet_wide(
     img
 }
 
+/// Render camera settings buttons with live state
+pub fn render_camera_state_buttons(deck: &mut StreamDeck, state: &crate::camera::CameraState) {
+    let key_size = 120_u32;
+
+    let toggle_btn = |label: &str, on: bool, icon: &str| -> DynamicImage {
+        let bg = if on { parse_hex("#1a2e1a") } else { parse_hex("#2e1a1a") };
+        let fg = if on { parse_hex("#66ff66") } else { parse_hex("#ff6666") };
+        render_button(label, Some(icon), key_size, bg, fg)
+    };
+
+    let fov_label = match state.fov {
+        0 => "Wide 90",
+        1 => "Med 78",
+        _ => "Narrow 65",
+    };
+
+    // Button 0: FOV (not a toggle, shows current)
+    let img = render_button(fov_label, Some("zoom_in"), key_size, parse_hex("#1a1a2e"), parse_hex("#70b8ff"));
+    deck.set_button_image(0, img).ok();
+
+    // Button 1: RightLight
+    if state.has_xu {
+        let img = toggle_btn(if state.rightlight { "RL: On" } else { "RL: Off" }, state.rightlight, "sun");
+        deck.set_button_image(1, img).ok();
+    }
+
+    // Button 2: Auto WB
+    let img = toggle_btn(if state.auto_wb { "AWB: On" } else { "AWB: Off" }, state.auto_wb, "moon");
+    deck.set_button_image(2, img).ok();
+
+    // Button 3: Auto Exposure
+    let img = toggle_btn(if state.auto_exposure { "AE: On" } else { "AE: Off" }, state.auto_exposure, "eye");
+    deck.set_button_image(3, img).ok();
+
+    // Button 4: Autofocus
+    let img = toggle_btn(if state.auto_focus { "AF: On" } else { "AF: Off" }, state.auto_focus, "af");
+    deck.set_button_image(4, img).ok();
+
+    deck.flush().ok();
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()

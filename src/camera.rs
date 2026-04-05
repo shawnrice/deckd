@@ -9,7 +9,12 @@ pub struct CameraState {
     pub pan: i32,        // -72000 to 72000
     pub tilt: i32,       // -72000 to 72000
     pub auto_focus: bool,
-    device: Option<String>, // "vid:pid" or None for auto-detect
+    pub auto_exposure: bool,
+    pub auto_wb: bool,
+    pub fov: u8,         // 0=wide, 1=medium, 2=narrow
+    pub rightlight: bool,
+    pub has_xu: bool,    // Whether Logitech XU is available
+    device: Option<String>,
 }
 
 impl CameraState {
@@ -19,12 +24,44 @@ impl CameraState {
             pan: 0,
             tilt: 0,
             auto_focus: true,
+            auto_exposure: true,
+            auto_wb: true,
+            fov: 0,
+            rightlight: false,
+            has_xu: false,
             device: camera_config,
         }
     }
 
     fn camera_id(&self) -> Option<&str> {
         self.device.as_deref()
+    }
+
+    /// Read current state from the camera hardware
+    pub fn sync_from_device(&mut self) {
+        let cam_id = self.device.clone();
+        let _ = with_camera(cam_id.as_deref(), |c| {
+            // Standard controls
+            if let Ok((cur, _, _)) = c.get_control_range(true, 0x08) {
+                self.auto_focus = cur != 0;
+            }
+            if let Ok((cur, _, _)) = c.get_control_range(true, 0x02) {
+                self.auto_exposure = cur == 2; // 2 = auto
+            }
+            if let Ok((cur, _, _)) = c.get_control_range(false, 0x0B) {
+                self.auto_wb = cur != 0;
+            }
+
+            // Logitech XU
+            self.has_xu = c.has_logitech_xu();
+            if self.has_xu {
+                self.fov = c.get_fov().unwrap_or(0);
+                self.rightlight = c.get_rightlight().unwrap_or(0) != 0;
+            }
+            Ok(())
+        });
+        info!("Camera state synced: AF={} AE={} AWB={} FOV={} RL={}",
+            self.auto_focus, self.auto_exposure, self.auto_wb, self.fov, self.rightlight);
     }
 }
 
@@ -140,25 +177,6 @@ pub fn adjust_white_balance(state: &mut CameraState, delta: i32) -> Result<(), S
     })
 }
 
-pub fn toggle_auto_white_balance(state: &mut CameraState) -> Result<(), String> {
-    // Toggle — read current, flip
-    with_camera(state.camera_id(), |c| {
-        let (cur, _, _) = c.get_control_range(false, 0x0B)?;
-        let new_val = if cur != 0 { false } else { true };
-        info!("Camera auto WB: {}", if new_val { "on" } else { "off" });
-        c.set_white_balance_auto(new_val)
-    })
-}
-
-pub fn toggle_auto_exposure(state: &mut CameraState) -> Result<(), String> {
-    with_camera(state.camera_id(), |c| {
-        let (cur, _, _) = c.get_control_range(true, 0x02)?;
-        let auto = cur == 2;
-        info!("Camera auto exposure: {}", if !auto { "on" } else { "off" });
-        c.set_exposure_auto(!auto)
-    })
-}
-
 pub fn set_fov_wide(state: &mut CameraState) -> Result<(), String> {
     info!("Camera FOV: 90° wide");
     with_camera(state.camera_id(), |c| c.set_fov(0))
@@ -175,30 +193,36 @@ pub fn set_fov_narrow(state: &mut CameraState) -> Result<(), String> {
 }
 
 pub fn cycle_fov(state: &mut CameraState) -> Result<(), String> {
-    with_camera(state.camera_id(), |c| {
-        let current = c.get_fov().unwrap_or(0);
-        let next = (current + 1) % 3;
-        let label = match next {
-            0 => "90° wide",
-            1 => "78° medium",
-            _ => "65° narrow",
-        };
-        info!("Camera FOV: {}", label);
-        c.set_fov(next)
-    })
+    state.fov = (state.fov + 1) % 3;
+    let label = match state.fov {
+        0 => "90° wide",
+        1 => "78° medium",
+        _ => "65° narrow",
+    };
+    info!("Camera FOV: {}", label);
+    with_camera(state.camera_id(), |c| c.set_fov(state.fov))
 }
 
 pub fn toggle_rightlight(state: &mut CameraState) -> Result<(), String> {
-    with_camera(state.camera_id(), |c| {
-        let current = c.get_rightlight().unwrap_or(0);
-        let next = if current != 0 { 0 } else { 1 };
-        info!("Camera RightLight: {}", if next != 0 { "on" } else { "off" });
-        c.set_rightlight(next)
-    })
+    state.rightlight = !state.rightlight;
+    info!("Camera RightLight: {}", if state.rightlight { "on" } else { "off" });
+    with_camera(state.camera_id(), |c| c.set_rightlight(if state.rightlight { 1 } else { 0 }))
 }
 
 pub fn toggle_autofocus(state: &mut CameraState) -> Result<(), String> {
     state.auto_focus = !state.auto_focus;
     info!("Camera autofocus: {}", if state.auto_focus { "on" } else { "off" });
     with_camera(state.camera_id(), |c| c.set_focus_auto(state.auto_focus))
+}
+
+pub fn toggle_auto_white_balance(state: &mut CameraState) -> Result<(), String> {
+    state.auto_wb = !state.auto_wb;
+    info!("Camera auto WB: {}", if state.auto_wb { "on" } else { "off" });
+    with_camera(state.camera_id(), |c| c.set_white_balance_auto(state.auto_wb))
+}
+
+pub fn toggle_auto_exposure(state: &mut CameraState) -> Result<(), String> {
+    state.auto_exposure = !state.auto_exposure;
+    info!("Camera auto exposure: {}", if state.auto_exposure { "on" } else { "off" });
+    with_camera(state.camera_id(), |c| c.set_exposure_auto(state.auto_exposure))
 }

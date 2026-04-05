@@ -468,7 +468,11 @@ fn start_daemon() {
                     info!("Switching to page: {}", new_page);
                     current_page = new_page;
                     render_page(&mut deck, &cfg, &current_page);
-                    // Force LCD refresh on page switch
+                    // Sync camera state when entering camera settings page
+                    if current_page == "cam_settings" {
+                        cam_state.sync_from_device();
+                        render::render_camera_state_buttons(&mut deck, &cam_state);
+                    }
                     last_lcd_refresh = Instant::now() - lcd_refresh_interval;
                 }
                 deck::InputResult::NeewerCommand(cmd) => {
@@ -480,31 +484,9 @@ fn start_daemon() {
                 }
                 deck::InputResult::CameraCommand(cmd) => {
                     handle_camera_command(&mut cam_state, &cmd);
-                    // Re-render focus button to show current AF state
-                    if cmd == "autofocus" && current_page == "camera" {
-                        let label = if cam_state.auto_focus { "AF: On" } else { "AF: Off" };
-                        let bg = if cam_state.auto_focus {
-                            "#1a2e1a"
-                        } else {
-                            "#2e1a1a"
-                        };
-                        let fg = if cam_state.auto_focus {
-                            "#66ff66"
-                        } else {
-                            "#ff6666"
-                        };
-                        let btn = config::ButtonConfig {
-                            label: Some(label.into()),
-                            icon: None,
-                            icon_name: Some("af".into()),
-                            on_press: None,
-                            on_long_press: None,
-                            bg_color: Some(bg.into()),
-                            fg_color: Some(fg.into()),
-                        };
-                        let mut buttons = std::collections::HashMap::new();
-                        buttons.insert("6".to_string(), btn);
-                        render::render_buttons(&mut deck, &buttons);
+                    // Re-render stateful buttons on camera pages
+                    if current_page == "cam_settings" {
+                        render::render_camera_state_buttons(&mut deck, &cam_state);
                     }
                 }
                 deck::InputResult::AudioCommand(cmd, amount) => {
@@ -845,7 +827,7 @@ fn handle_camera_command(state: &mut camera::CameraState, cmd: &str) {
         "wb_up" => camera::adjust_white_balance(state, 200),
         "wb_down" => camera::adjust_white_balance(state, -200),
         "wb_auto" => camera::toggle_auto_white_balance(state),
-        "ae_auto" => camera::toggle_auto_exposure(state),
+        "ae_auto" | "auto_exposure" => camera::toggle_auto_exposure(state),
         "fov_wide" => camera::set_fov_wide(state),
         "fov_medium" => camera::set_fov_medium(state),
         "fov_narrow" => camera::set_fov_narrow(state),
