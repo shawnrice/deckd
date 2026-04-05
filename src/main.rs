@@ -12,6 +12,7 @@ mod render;
 mod soundboard;
 mod sysmon;
 mod tamagotchi;
+mod uvc;
 mod timer;
 
 use std::sync::Arc;
