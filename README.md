@@ -147,14 +147,30 @@ deckd auth google
 
 Shows next meeting countdown on the LCD.
 
+### Monitoring
+
+Swipe to the monitor page on the LCD for system stats. Alerts fire as notification banners when things go wrong.
+
+```toml
+[monitoring]
+system_stats = true        # CPU load + memory %
+containers = true           # Docker/Podman running + unhealthy
+network_ping = "1.1.1.1"   # Latency, alerts if unreachable
+```
+
+Alerts on: CPU > 4.0, unhealthy containers, network down, CI failures on your PRs.
+
 ## Features
 
+- **CI failure alerts** — notifies when any of your PRs fails CI, clears when fixed
+- **System monitoring** — CPU, memory, containers, network latency, uptime on a dedicated LCD page
 - **Auto-meeting mode** — detects Zoom/Google Meet, switches page and light presets automatically
-- **Audio device cycling** — rotary encoder cycles output/input devices, excludes virtual devices (ZoomAudioDevice)
+- **Audio device cycling** — rotary encoder cycles output/input devices, excludes virtual devices
 - **Pomodoro timer** — start from button or CLI (`deckd timer start_25`)
-- **Soundboard** — drop `.wav`/`.mp3` files in `assets/sounds/`, trigger from buttons
-- **Notifications** — `deckd notify "deploy done"` shows a toast on the LCD strip
-- **Hot reload** — config auto-reloads on save, or `deckd reload` / `SIGHUP`
+- **Soundboard** — drop `.wav`/`.mp3` files in `assets/sounds/`, trigger from buttons or `deckd sound <name>`
+- **Notifications** — `deckd notify "deploy done"` shows a toast on the LCD strip; also receives from Claude Code hooks via UDP
+- **Hot reload** — config auto-reloads on file change, or `deckd reload` / `SIGHUP`
+- **Sleep/wake resilience** — auto-restarts via launchd, skips BLE scan on quick restart
 
 ## The pet
 
