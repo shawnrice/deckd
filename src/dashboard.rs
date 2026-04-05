@@ -160,11 +160,12 @@ pub fn mark_audio_changed(state: &SharedDashboard) {
 /// Start the background dashboard poller thread
 pub fn start_poller(state: SharedDashboard, github_repo: Option<String>, monitoring: MonitoringConfig) {
     thread::spawn(move || {
-        // Immediate poll
+        let boot_time = Instant::now();
+
+        // Immediate poll (except sysmon — skip during boot spike)
         poll_audio(&state);
         poll_github(&state, github_repo.as_deref());
         poll_calendar(&state);
-        poll_sysmon(&state, &monitoring);
 
         let mut last_audio = Instant::now();
         let mut last_meeting_detect = Instant::now();
@@ -203,7 +204,7 @@ pub fn start_poller(state: SharedDashboard, github_repo: Option<String>, monitor
 
             // System stats: every 10 seconds (lightweight)
             if last_sysmon.elapsed() >= Duration::from_secs(10) {
-                poll_sysmon(&state, &monitoring);
+                poll_sysmon(&state, &monitoring, boot_time);
                 last_sysmon = Instant::now();
             }
 
@@ -657,16 +658,19 @@ fn extract_json_pr_numbers(json: &str, key: &str) -> HashSet<u32> {
         .collect()
 }
 
-fn poll_sysmon(state: &SharedDashboard, monitoring: &MonitoringConfig) {
+fn poll_sysmon(state: &SharedDashboard, monitoring: &MonitoringConfig, boot_time: Instant) {
     if monitoring.system_stats.unwrap_or(false) {
         let cpu = sysmon::poll_cpu_load();
         let mem = sysmon::poll_memory();
         let uptime = sysmon::poll_uptime();
 
         if let Ok(mut s) = state.lock() {
-            // Notify on high CPU load
+            // Notify on high CPU load (skip first 60s after boot to avoid wake spike)
             if let Some(load) = cpu {
-                if load > 4.0 && s.cpu_load.map(|prev| prev <= 4.0).unwrap_or(true) {
+                if load > 4.0
+                    && boot_time.elapsed() > Duration::from_secs(60)
+                    && s.cpu_load.map(|prev| prev <= 4.0).unwrap_or(true)
+                {
                     s.notifications.push(Notification {
                         message: format!("High CPU load: {:.1}", load),
                         created: Instant::now(),
