@@ -154,6 +154,20 @@ write_wav('$SOUNDS/timer_done.wav', tone(880, 0.3, 0.3) + [0]*int(RATE*0.1) + to
 " 2>/dev/null
 echo "  Generated success + timer_done"
 
+# Download real sounds
+echo "Downloading sounds..."
+curl -sL "https://orangefreesounds.com/wp-content/uploads/2022/04/Sad-trombone.mp3" -o "$SOUNDS/sad_trombone.mp3" 2>/dev/null && echo "  sad_trombone"
+curl -sL "https://www.myinstants.com/media/sounds/crickets.mp3" -o "$SOUNDS/crickets_full.mp3" 2>/dev/null
+if [ -f "$SOUNDS/crickets_full.mp3" ]; then
+    ffmpeg -y -i "$SOUNDS/crickets_full.mp3" -t 1.5 -af "afade=t=out:st=1:d=0.5" "$SOUNDS/crickets.mp3" 2>/dev/null && echo "  crickets"
+    rm "$SOUNDS/crickets_full.mp3"
+fi
+curl -sL "https://www.myinstants.com/media/sounds/sitcom-laughing.mp3" -o "$SOUNDS/laugh_full.mp3" 2>/dev/null
+if [ -f "$SOUNDS/laugh_full.mp3" ]; then
+    ffmpeg -y -i "$SOUNDS/laugh_full.mp3" -t 2 -af "afade=t=out:st=1.5:d=0.5" "$SOUNDS/laugh.mp3" 2>/dev/null && echo "  laugh"
+    rm "$SOUNDS/laugh_full.mp3"
+fi
+
 echo ""
 echo "Done! Assets ready at $ASSETS/"
 echo "Icons: $(ls "$ICONS"/*.png 2>/dev/null | wc -l | tr -d ' ')"
