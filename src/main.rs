@@ -480,6 +480,32 @@ fn start_daemon() {
                 }
                 deck::InputResult::CameraCommand(cmd) => {
                     handle_camera_command(&mut cam_state, &cmd);
+                    // Re-render focus button to show current AF state
+                    if cmd == "autofocus" && current_page == "camera" {
+                        let label = if cam_state.auto_focus { "AF: On" } else { "AF: Off" };
+                        let bg = if cam_state.auto_focus {
+                            "#1a2e1a"
+                        } else {
+                            "#2e1a1a"
+                        };
+                        let fg = if cam_state.auto_focus {
+                            "#66ff66"
+                        } else {
+                            "#ff6666"
+                        };
+                        let btn = config::ButtonConfig {
+                            label: Some(label.into()),
+                            icon: None,
+                            icon_name: Some("af".into()),
+                            on_press: None,
+                            on_long_press: None,
+                            bg_color: Some(bg.into()),
+                            fg_color: Some(fg.into()),
+                        };
+                        let mut buttons = std::collections::HashMap::new();
+                        buttons.insert("6".to_string(), btn);
+                        render::render_buttons(&mut deck, &buttons);
+                    }
                 }
                 deck::InputResult::AudioCommand(cmd, amount) => {
                     handle_audio_command(&dash_state, &cmd, amount, &mut audio_cycler);
@@ -808,6 +834,18 @@ fn handle_camera_command(state: &mut camera::CameraState, cmd: &str) {
         "tilt_up" => camera::tilt_up(state),
         "tilt_down" => camera::tilt_down(state),
         "autofocus" => camera::toggle_autofocus(state),
+        "brightness_up" => camera::adjust_brightness(state, 10),
+        "brightness_down" => camera::adjust_brightness(state, -10),
+        "contrast_up" => camera::adjust_contrast(state, 10),
+        "contrast_down" => camera::adjust_contrast(state, -10),
+        "saturation_up" => camera::adjust_saturation(state, 10),
+        "saturation_down" => camera::adjust_saturation(state, -10),
+        "sharpness_up" => camera::adjust_sharpness(state, 10),
+        "sharpness_down" => camera::adjust_sharpness(state, -10),
+        "wb_up" => camera::adjust_white_balance(state, 200),
+        "wb_down" => camera::adjust_white_balance(state, -200),
+        "wb_auto" => camera::toggle_auto_white_balance(state),
+        "ae_auto" => camera::toggle_auto_exposure(state),
         other => {
             warn!("Unknown camera command: {}", other);
             Ok(())

@@ -9,17 +9,32 @@ use rusb::{DeviceHandle, GlobalContext};
 // ── UVC Constants (spec Table A-12, A-14) ───────────────────────
 #[allow(dead_code)]
 mod consts {
+    // Request types
     pub const SET_CUR: u8 = 0x01;
     pub const GET_CUR: u8 = 0x81;
+    pub const GET_MIN: u8 = 0x82;
+    pub const GET_MAX: u8 = 0x83;
     pub const REQ_TYPE_SET: u8 = 0x21;
     pub const REQ_TYPE_GET: u8 = 0xA1;
+
+    // Camera Terminal selectors (CT)
     pub const CT_AE_MODE: u8 = 0x02;
+    pub const CT_EXPOSURE_TIME_ABS: u8 = 0x04;
     pub const CT_FOCUS_ABSOLUTE: u8 = 0x06;
     pub const CT_FOCUS_AUTO: u8 = 0x08;
     pub const CT_ZOOM_ABSOLUTE: u8 = 0x0B;
     pub const CT_PANTILT_ABSOLUTE: u8 = 0x0D;
+
+    // Processing Unit selectors (PU)
+    pub const PU_BACKLIGHT_COMP: u8 = 0x01;
     pub const PU_BRIGHTNESS: u8 = 0x02;
     pub const PU_CONTRAST: u8 = 0x03;
+    pub const PU_GAIN: u8 = 0x04;
+    pub const PU_POWER_LINE_FREQ: u8 = 0x05;
+    pub const PU_SATURATION: u8 = 0x07;
+    pub const PU_SHARPNESS: u8 = 0x08;
+    pub const PU_WHITE_BALANCE_TEMP: u8 = 0x0A;
+    pub const PU_WHITE_BALANCE_AUTO: u8 = 0x0B;
 }
 use consts::*;
 
@@ -235,6 +250,15 @@ impl Camera {
         self.set_ct_control(CT_FOCUS_AUTO, &[if on { 1 } else { 0 }])
     }
 
+    pub fn set_exposure_auto(&self, on: bool) -> Result<(), String> {
+        // AE mode: 1=manual, 2=auto, 4=shutter priority, 8=aperture priority
+        self.set_ct_control(CT_AE_MODE, &[if on { 2 } else { 1 }])
+    }
+
+    pub fn set_exposure_time(&self, value: i32) -> Result<(), String> {
+        self.set_ct_control(CT_EXPOSURE_TIME_ABS, &(value as u32).to_le_bytes())
+    }
+
     // ── Processing Unit controls ─────────────────────────────────
 
     pub fn set_brightness(&self, value: i32) -> Result<(), String> {
@@ -245,6 +269,59 @@ impl Camera {
         let mut buf = [0u8; 2];
         self.get_pu_control(PU_BRIGHTNESS, &mut buf)?;
         Ok(i16::from_le_bytes(buf) as i32)
+    }
+
+    pub fn set_contrast(&self, value: i32) -> Result<(), String> {
+        self.set_pu_control(PU_CONTRAST, &(value as u16).to_le_bytes())
+    }
+
+    pub fn set_saturation(&self, value: i32) -> Result<(), String> {
+        self.set_pu_control(PU_SATURATION, &(value as u16).to_le_bytes())
+    }
+
+    pub fn set_sharpness(&self, value: i32) -> Result<(), String> {
+        self.set_pu_control(PU_SHARPNESS, &(value as u16).to_le_bytes())
+    }
+
+    pub fn set_gain(&self, value: i32) -> Result<(), String> {
+        self.set_pu_control(PU_GAIN, &(value as u16).to_le_bytes())
+    }
+
+    pub fn set_white_balance_auto(&self, on: bool) -> Result<(), String> {
+        self.set_pu_control(PU_WHITE_BALANCE_AUTO, &[if on { 1 } else { 0 }])
+    }
+
+    pub fn set_white_balance_temp(&self, kelvin: i32) -> Result<(), String> {
+        self.set_pu_control(PU_WHITE_BALANCE_TEMP, &(kelvin as u16).to_le_bytes())
+    }
+
+    pub fn set_backlight_compensation(&self, value: i32) -> Result<(), String> {
+        self.set_pu_control(PU_BACKLIGHT_COMP, &(value as u16).to_le_bytes())
+    }
+
+    /// Get a control's current, min, and max values (for discovering ranges)
+    pub fn get_control_range(&self, is_ct: bool, selector: u8) -> Result<(i32, i32, i32), String> {
+        let unit = if is_ct { self.camera_terminal_id } else { self.processing_unit_id };
+        let mut cur_buf = [0u8; 2];
+        let mut min_buf = [0u8; 2];
+        let mut max_buf = [0u8; 2];
+
+        self.control_get(selector, unit, &mut cur_buf)?;
+        let w_value = (selector as u16) << 8;
+        let w_index = (unit as u16) << 8 | self.interface as u16;
+
+        self.handle
+            .read_control(REQ_TYPE_GET, GET_MIN, w_value, w_index, &mut min_buf, TIMEOUT)
+            .map_err(|e| format!("GET_MIN: {}", e))?;
+        self.handle
+            .read_control(REQ_TYPE_GET, GET_MAX, w_value, w_index, &mut max_buf, TIMEOUT)
+            .map_err(|e| format!("GET_MAX: {}", e))?;
+
+        Ok((
+            i16::from_le_bytes(cur_buf) as i32,
+            i16::from_le_bytes(min_buf) as i32,
+            i16::from_le_bytes(max_buf) as i32,
+        ))
     }
 
     // ── Low-level control transfers ──────────────────────────────

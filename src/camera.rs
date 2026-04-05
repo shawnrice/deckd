@@ -93,6 +93,72 @@ pub fn tilt_down(state: &mut CameraState) -> Result<(), String> {
     with_camera(state.camera_id(), |c| c.set_pantilt(state.pan, state.tilt))
 }
 
+pub fn adjust_brightness(state: &mut CameraState, delta: i32) -> Result<(), String> {
+    with_camera(state.camera_id(), |c| {
+        let (cur, min, max) = c.get_control_range(false, 0x02)?;
+        let new_val = (cur + delta).clamp(min, max);
+        info!("Camera brightness: {} ({}..{})", new_val, min, max);
+        c.set_brightness(new_val)
+    })
+}
+
+pub fn adjust_contrast(state: &mut CameraState, delta: i32) -> Result<(), String> {
+    with_camera(state.camera_id(), |c| {
+        let (cur, min, max) = c.get_control_range(false, 0x03)?;
+        let new_val = (cur + delta).clamp(min, max);
+        info!("Camera contrast: {} ({}..{})", new_val, min, max);
+        c.set_contrast(new_val)
+    })
+}
+
+pub fn adjust_saturation(state: &mut CameraState, delta: i32) -> Result<(), String> {
+    with_camera(state.camera_id(), |c| {
+        let (cur, min, max) = c.get_control_range(false, 0x07)?;
+        let new_val = (cur + delta).clamp(min, max);
+        info!("Camera saturation: {} ({}..{})", new_val, min, max);
+        c.set_saturation(new_val)
+    })
+}
+
+pub fn adjust_sharpness(state: &mut CameraState, delta: i32) -> Result<(), String> {
+    with_camera(state.camera_id(), |c| {
+        let (cur, min, max) = c.get_control_range(false, 0x08)?;
+        let new_val = (cur + delta).clamp(min, max);
+        info!("Camera sharpness: {} ({}..{})", new_val, min, max);
+        c.set_sharpness(new_val)
+    })
+}
+
+pub fn adjust_white_balance(state: &mut CameraState, delta: i32) -> Result<(), String> {
+    with_camera(state.camera_id(), |c| {
+        // Disable auto WB first
+        c.set_white_balance_auto(false).ok();
+        let (cur, min, max) = c.get_control_range(false, 0x0A)?;
+        let new_val = (cur + delta).clamp(min, max);
+        info!("Camera white balance: {}K ({}..{})", new_val, min, max);
+        c.set_white_balance_temp(new_val)
+    })
+}
+
+pub fn toggle_auto_white_balance(state: &mut CameraState) -> Result<(), String> {
+    // Toggle — read current, flip
+    with_camera(state.camera_id(), |c| {
+        let (cur, _, _) = c.get_control_range(false, 0x0B)?;
+        let new_val = if cur != 0 { false } else { true };
+        info!("Camera auto WB: {}", if new_val { "on" } else { "off" });
+        c.set_white_balance_auto(new_val)
+    })
+}
+
+pub fn toggle_auto_exposure(state: &mut CameraState) -> Result<(), String> {
+    with_camera(state.camera_id(), |c| {
+        let (cur, _, _) = c.get_control_range(true, 0x02)?;
+        let auto = cur == 2;
+        info!("Camera auto exposure: {}", if !auto { "on" } else { "off" });
+        c.set_exposure_auto(!auto)
+    })
+}
+
 pub fn toggle_autofocus(state: &mut CameraState) -> Result<(), String> {
     state.auto_focus = !state.auto_focus;
     info!("Camera autofocus: {}", if state.auto_focus { "on" } else { "off" });
