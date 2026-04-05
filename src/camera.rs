@@ -1,10 +1,6 @@
-use log::{info, warn};
+use log::info;
 
 use crate::uvc::Camera;
-
-// Logitech MX Brio
-const VENDOR_ID: u16 = 0x046d;
-const PRODUCT_ID: u16 = 0x0944;
 
 /// Camera state tracking
 #[derive(Debug, Clone)]
@@ -30,7 +26,7 @@ fn with_camera<F>(f: F) -> Result<(), String>
 where
     F: FnOnce(&Camera) -> Result<(), String>,
 {
-    let cam = Camera::open(VENDOR_ID, PRODUCT_ID)?;
+    let cam = Camera::open_any()?;
     f(&cam)
 }
 

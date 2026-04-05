@@ -52,6 +52,35 @@ impl Camera {
             })
             .ok_or_else(|| format!("Camera {:04x}:{:04x} not found", vendor_id, product_id))?;
 
+        Self::open_device(device)
+    }
+
+    /// Open the first UVC camera found on the system.
+    pub fn open_any() -> Result<Self, String> {
+        let device = rusb::devices()
+            .map_err(|e| format!("USB enumeration: {}", e))?
+            .iter()
+            .find(|d| {
+                let config = match d.active_config_descriptor() {
+                    Ok(c) => c,
+                    Err(_) => return false,
+                };
+                // Look for UVC Video Control interface (class 14, subclass 1)
+                config.interfaces().any(|iface| {
+                    iface.descriptors().any(|desc| {
+                        desc.class_code() == 14 && desc.sub_class_code() == 1
+                    })
+                })
+            })
+            .ok_or("No UVC camera found")?;
+
+        let desc = device.device_descriptor().map_err(|e| format!("USB descriptor: {}", e))?;
+        info!("Auto-detected UVC camera: {:04x}:{:04x}", desc.vendor_id(), desc.product_id());
+
+        Self::open_device(device)
+    }
+
+    fn open_device(device: rusb::Device<GlobalContext>) -> Result<Self, String> {
         let handle = device.open().map_err(|e| format!("USB open: {}", e))?;
 
         // Find the UVC Video Control interface (class 14, subclass 1)
@@ -105,9 +134,10 @@ impl Camera {
             }
         }
 
+        let dev_desc = device.device_descriptor().map_err(|e| format!("USB descriptor: {}", e))?;
         info!(
             "UVC camera opened: {:04x}:{:04x} interface={} CT={} PU={}",
-            vendor_id, product_id, interface_num, camera_terminal_id, processing_unit_id
+            dev_desc.vendor_id(), dev_desc.product_id(), interface_num, camera_terminal_id, processing_unit_id
         );
 
         Ok(Camera {
