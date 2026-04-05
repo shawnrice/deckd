@@ -1114,6 +1114,34 @@ fn render_pet_wide(
 }
 
 /// Render camera settings buttons with live state
+/// Render a stateful light toggle button on button 0.
+/// Shows "Lights: On" (green) when on, "Lights: Off" (red) when off.
+pub fn render_light_toggle_button(deck: &mut StreamDeck, on: bool) {
+    let key_size = 120_u32;
+    let (label, bg, fg) = if on {
+        ("Lights: On", parse_hex("#1a3a1a"), parse_hex("#66ff66"))
+    } else {
+        ("Lights: Off", parse_hex("#3a1a1a"), parse_hex("#ff6666"))
+    };
+    let img = render_button(label, Some("power"), key_size, bg, fg);
+    deck.set_button_image(0, img).ok();
+    deck.flush().ok();
+}
+
+/// Render a stateful mic mute button on button 0.
+/// Shows "Mic: On" (green) when unmuted, "Mic: Muted" (red) when muted.
+pub fn render_mic_button(deck: &mut StreamDeck, muted: bool) {
+    let key_size = 120_u32;
+    let (label, icon, bg, fg) = if muted {
+        ("Mic: Muted", "mic_mute", parse_hex("#3a1a1a"), parse_hex("#ff6666"))
+    } else {
+        ("Mic: On", "mic", parse_hex("#1a3a1a"), parse_hex("#66ff66"))
+    };
+    let img = render_button(label, Some(icon), key_size, bg, fg);
+    deck.set_button_image(0, img).ok();
+    deck.flush().ok();
+}
+
 pub fn render_camera_state_buttons(deck: &mut StreamDeck, state: &crate::camera::CameraState) {
     let key_size = 120_u32;
 

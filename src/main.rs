@@ -473,6 +473,17 @@ fn start_daemon() {
                         cam_state.sync_from_device();
                         render::render_camera_state_buttons(&mut deck, &cam_state);
                     }
+                    // Render stateful light toggle on entry
+                    if current_page == "keylights" {
+                        render::render_light_toggle_button(&mut deck, lights::keylights_on(&all_lights));
+                    } else if current_page == "desklights" {
+                        render::render_light_toggle_button(&mut deck, lights::desklights_on(&all_lights));
+                    }
+                    // Render stateful mic button on meeting page entry
+                    if current_page == "meeting" {
+                        let muted = dash_state.lock().map(|s| s.mic_muted).unwrap_or(false);
+                        render::render_mic_button(&mut deck, muted);
+                    }
                     last_lcd_refresh = Instant::now() - lcd_refresh_interval;
                 }
                 deck::InputResult::NeewerCommand(cmd) => {
@@ -481,6 +492,12 @@ fn start_daemon() {
                         continue;
                     }
                     handle_light_command(&mut all_lights, &cmd, &rt);
+                    // Re-render stateful light toggle on keylights/desklights pages
+                    if current_page == "keylights" {
+                        render::render_light_toggle_button(&mut deck, lights::keylights_on(&all_lights));
+                    } else if current_page == "desklights" {
+                        render::render_light_toggle_button(&mut deck, lights::desklights_on(&all_lights));
+                    }
                 }
                 deck::InputResult::CameraCommand(cmd) => {
                     handle_camera_command(&mut cam_state, &cmd);
@@ -491,6 +508,11 @@ fn start_daemon() {
                 }
                 deck::InputResult::AudioCommand(cmd, amount) => {
                     handle_audio_command(&dash_state, &cmd, amount, &mut audio_cycler);
+                    // Re-render mic button on meeting page after mic toggle
+                    if cmd == "mic_toggle" && current_page == "meeting" {
+                        let muted = dash_state.lock().map(|s| s.mic_muted).unwrap_or(false);
+                        render::render_mic_button(&mut deck, muted);
+                    }
                     // Instant LCD refresh
                     if current_page == "main" {
                         if let Ok(dash) = dash_state.lock() {
@@ -649,6 +671,9 @@ fn start_daemon() {
                     handle_light_command(&mut all_lights, "preset:30:5000:desklights", &rt);
                     current_page = "meeting".into();
                     render_page(&mut deck, &cfg, &current_page);
+                    // Render stateful mic button
+                    let muted = dash_state.lock().map(|s| s.mic_muted).unwrap_or(false);
+                    render::render_mic_button(&mut deck, muted);
                     last_lcd_refresh = Instant::now() - lcd_refresh_interval;
                 } else if !in_meeting && current_page == "meeting" {
                     // Auto-exit meeting mode

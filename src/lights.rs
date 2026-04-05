@@ -161,7 +161,20 @@ pub struct Light {
     pub is_gl1: bool,  // GL1 PRO uses long CCT (0x82/0x83) over BLE
     pub is_pl81: bool, // PL81 PRO uses 0x3A serial protocol
     transport: Transport,
-    state: LightState,
+    pub state: LightState,
+}
+
+#[allow(dead_code)]
+pub fn any_on(lights: &[Light]) -> bool {
+    lights.iter().any(|l| l.state.on)
+}
+
+pub fn keylights_on(lights: &[Light]) -> bool {
+    lights.iter().filter(|l| l.is_gl1).any(|l| l.state.on)
+}
+
+pub fn desklights_on(lights: &[Light]) -> bool {
+    lights.iter().filter(|l| l.is_pl81).any(|l| l.state.on)
 }
 
 #[allow(dead_code)]
