@@ -536,3 +536,61 @@ fn poll_calendar(state: &SharedDashboard) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_json_number_valid() {
+        let json = r#"{"openPRCount":5,"reviewRequestCount":2}"#;
+        assert_eq!(extract_json_number(json, "openPRCount"), Some(5));
+        assert_eq!(extract_json_number(json, "reviewRequestCount"), Some(2));
+    }
+
+    #[test]
+    fn extract_json_number_zero() {
+        let json = r#"{"count":0}"#;
+        assert_eq!(extract_json_number(json, "count"), Some(0));
+    }
+
+    #[test]
+    fn extract_json_number_missing_key() {
+        let json = r#"{"count":5}"#;
+        assert_eq!(extract_json_number(json, "missing"), None);
+    }
+
+    #[test]
+    fn extract_json_number_non_numeric_value() {
+        let json = r#"{"count":"abc"}"#;
+        assert_eq!(extract_json_number(json, "count"), None);
+    }
+
+    #[test]
+    fn extract_json_string_valid() {
+        let json = r#"{"latestTitle":"Fix bug","latestStatus":"approved"}"#;
+        assert_eq!(extract_json_string(json, "latestTitle").unwrap(), "Fix bug");
+        assert_eq!(extract_json_string(json, "latestStatus").unwrap(), "approved");
+    }
+
+    #[test]
+    fn extract_json_string_empty() {
+        let json = r#"{"title":""}"#;
+        assert_eq!(extract_json_string(json, "title").unwrap(), "");
+    }
+
+    #[test]
+    fn extract_json_string_missing_key() {
+        let json = r#"{"title":"hello"}"#;
+        assert_eq!(extract_json_string(json, "missing"), None);
+    }
+
+    #[test]
+    fn extract_github_graphql_response() {
+        let json = r#"{"openPRCount":3,"reviewRequestCount":1,"approvedCount":2,"mergeableCount":1,"issueCount":5,"latestTitle":"Add feature X","latestStatus":"review","latestChecks":"SUCCESS"}"#;
+        assert_eq!(extract_json_number(json, "openPRCount"), Some(3));
+        assert_eq!(extract_json_number(json, "mergeableCount"), Some(1));
+        assert_eq!(extract_json_string(json, "latestTitle").unwrap(), "Add feature X");
+        assert_eq!(extract_json_string(json, "latestChecks").unwrap(), "SUCCESS");
+    }
+}

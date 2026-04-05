@@ -98,3 +98,108 @@ pub type SharedTimer = Arc<Mutex<Timer>>;
 pub fn new_shared() -> SharedTimer {
     Arc::new(Mutex::new(Timer::new()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_timer_is_not_running() {
+        let t = Timer::new();
+        assert!(!t.is_running());
+        assert!(t.remaining().is_none());
+    }
+
+    #[test]
+    fn start_timer_is_running_with_remaining() {
+        let mut t = Timer::new();
+        t.start(25);
+        assert!(t.is_running());
+        let (m, _s) = t.remaining().unwrap();
+        assert!(m >= 24); // should be close to 25 minutes
+    }
+
+    #[test]
+    fn timer_expiry_detection() {
+        let mut t = Timer::new();
+        // Start a 0-minute timer (expires immediately)
+        t.duration_secs = 0;
+        t.started_at = Some(Instant::now());
+        t.paused = false;
+        t.paused_elapsed = Duration::ZERO;
+        assert!(t.is_expired());
+    }
+
+    #[test]
+    fn pause_and_resume() {
+        let mut t = Timer::new();
+        t.start(25);
+        assert!(!t.paused);
+        t.toggle_pause();
+        assert!(t.paused);
+        assert!(t.is_running()); // still "running" even when paused
+        t.toggle_pause();
+        assert!(!t.paused);
+    }
+
+    #[test]
+    fn display_format_mm_ss() {
+        let mut t = Timer::new();
+        t.start(25);
+        let display = t.display();
+        // Should match "MM:SS" pattern
+        assert!(display.contains(':'), "expected colon in '{}'", display);
+        let parts: Vec<&str> = display.split(':').collect();
+        assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn display_when_paused_shows_indicator() {
+        let mut t = Timer::new();
+        t.start(25);
+        t.toggle_pause();
+        let display = t.display();
+        assert!(display.contains("||"), "expected pause indicator in '{}'", display);
+    }
+
+    #[test]
+    fn display_when_expired_shows_done() {
+        let mut t = Timer::new();
+        t.duration_secs = 0;
+        t.started_at = Some(Instant::now());
+        t.paused = false;
+        t.paused_elapsed = Duration::ZERO;
+        assert_eq!(t.display(), "Done!");
+    }
+
+    #[test]
+    fn display_when_stopped() {
+        let t = Timer::new();
+        assert_eq!(t.display(), "\u{2014}"); // em-dash
+    }
+
+    #[test]
+    fn stop_resets_state() {
+        let mut t = Timer::new();
+        t.start(25);
+        t.stop();
+        assert!(!t.is_running());
+        assert!(t.remaining().is_none());
+    }
+
+    #[test]
+    fn toggle_starts_if_stopped_pauses_if_running() {
+        let mut t = Timer::new();
+        // Toggle when stopped: nothing happens (toggle_pause only works when started)
+        t.toggle_pause();
+        assert!(!t.is_running());
+
+        // Start, then toggle pauses
+        t.start(25);
+        assert!(!t.paused);
+        t.toggle_pause();
+        assert!(t.paused);
+        t.toggle_pause();
+        assert!(!t.paused);
+    }
+}

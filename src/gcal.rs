@@ -312,3 +312,28 @@ fn minutes_until(datetime_str: &str) -> i32 {
 
     ((event_epoch - now_output) / 60) as i32
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urlenc_leaves_unreserved_chars() {
+        assert_eq!(urlenc("hello"), "hello");
+        assert_eq!(urlenc("a-b_c.d~e"), "a-b_c.d~e");
+    }
+
+    #[test]
+    fn urlenc_encodes_special_chars() {
+        assert_eq!(urlenc("a b"), "a%20b");
+        assert_eq!(urlenc("foo@bar"), "foo%40bar");
+        assert_eq!(urlenc("a+b=c"), "a%2Bb%3Dc");
+    }
+
+    #[test]
+    fn urlenc_encodes_url() {
+        let encoded = urlenc("http://localhost:8085");
+        assert!(encoded.contains("%3A"));
+        assert!(encoded.contains("%2F"));
+    }
+}

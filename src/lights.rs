@@ -553,3 +553,92 @@ pub fn discover_ble(rt: &tokio::runtime::Runtime) -> Vec<Light> {
     }
     lights
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checksum_is_8bit_sum() {
+        assert_eq!(checksum(&[0x78, 0x81, 0x01, 0x01]), 0xFB);
+        assert_eq!(checksum(&[0x78, 0x81, 0x01, 0x02]), 0xFC);
+        // Verify wrapping: sum > 255 truncates to low byte
+        assert_eq!(checksum(&[0xFF, 0xFF]), 0xFE);
+    }
+
+    #[test]
+    fn cmd_power_on() {
+        assert_eq!(cmd_power(true), vec![0x78, 0x81, 0x01, 0x01, 0xFB]);
+    }
+
+    #[test]
+    fn cmd_power_off() {
+        assert_eq!(cmd_power(false), vec![0x78, 0x81, 0x01, 0x02, 0xFC]);
+    }
+
+    #[test]
+    fn cmd_cct_checksum() {
+        let pkt = cmd_cct(50, 0x2C);
+        assert_eq!(pkt.len(), 6);
+        assert_eq!(pkt[0], CMD_PREFIX);
+        assert_eq!(pkt[1], TAG_CCT);
+        assert_eq!(pkt[2], 0x02);
+        assert_eq!(pkt[3], 50);
+        assert_eq!(pkt[4], 0x2C);
+        let expected_chk = checksum(&[CMD_PREFIX, TAG_CCT, 0x02, 50, 0x2C]);
+        assert_eq!(pkt[5], expected_chk);
+    }
+
+    #[test]
+    fn cmd_long_cct_brightness_bytes() {
+        let pkt = cmd_long_cct_brightness(80);
+        assert_eq!(&pkt[..4], &[0x78, 0x82, 0x01, 0x50]);
+        let expected_chk = checksum(&[0x78, 0x82, 0x01, 0x50]);
+        assert_eq!(pkt[4], expected_chk);
+    }
+
+    #[test]
+    fn cmd_long_cct_temp_bytes() {
+        let pkt = cmd_long_cct_temp(0x2C);
+        assert_eq!(&pkt[..4], &[0x78, 0x83, 0x01, 0x2C]);
+        let expected_chk = checksum(&[0x78, 0x83, 0x01, 0x2C]);
+        assert_eq!(pkt[4], expected_chk);
+    }
+
+    #[test]
+    fn pl81_checksum_is_big_endian_16bit_sum() {
+        let cs = pl81_checksum(&[0x3A, 0x02, 0x03, 0x01, 100, 0x09]);
+        let sum: u16 = [0x3Au16, 0x02, 0x03, 0x01, 100, 0x09].iter().sum();
+        assert_eq!(cs, [(sum >> 8) as u8, (sum & 0xFF) as u8]);
+    }
+
+    #[test]
+    fn pl81_cmd_cct_format() {
+        let pkt = pl81_cmd_cct(100, 0x09);
+        assert_eq!(pkt[0], PL81_PREFIX);
+        assert_eq!(pkt[1], 0x02);
+        assert_eq!(pkt[2], 0x03);
+        assert_eq!(pkt[3], 0x01);
+        assert_eq!(pkt[4], 100);
+        assert_eq!(pkt[5], 0x09);
+        let cs = pl81_checksum(&pkt[..6]);
+        assert_eq!(&pkt[6..], &cs);
+    }
+
+    #[test]
+    fn kelvin_to_pl81_temp_boundaries() {
+        assert_eq!(kelvin_to_pl81_temp(2900), 0x00);
+        assert_eq!(kelvin_to_pl81_temp(7000), 0x12);
+        // Clamp below minimum
+        assert_eq!(kelvin_to_pl81_temp(1000), 0x00);
+        // Clamp above maximum
+        assert_eq!(kelvin_to_pl81_temp(9000), 0x12);
+    }
+
+    #[test]
+    fn kelvin_to_pl81_temp_midrange() {
+        let mid = kelvin_to_pl81_temp(4400);
+        // 4400K is (4400-2900)/4100 * 18 = 1500/4100 * 18 ≈ 6.59 → rounds to 7
+        assert_eq!(mid, 7);
+    }
+}

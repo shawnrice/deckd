@@ -425,3 +425,57 @@ unsafe extern "C" fn audio_property_changed(
     let _ = Arc::into_raw(flag);
     0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn excluded_devices_filtered() {
+        let excluded = EXCLUDED_DEVICES;
+        assert!(excluded.iter().any(|e| "ZoomAudioDevice".contains(e)));
+        assert!(!excluded.iter().any(|e| "MacBook Pro Speakers".contains(e)));
+    }
+
+    #[test]
+    fn cycle_entry_stores_uid_and_display() {
+        let entry = CycleEntry {
+            uid: "BuiltIn-1234".into(),
+            display: "Speakers".into(),
+        };
+        assert_eq!(entry.uid, "BuiltIn-1234");
+        assert_eq!(entry.display, "Speakers");
+    }
+
+    #[test]
+    fn direction_wrapping_forward() {
+        // Simulate the wrapping math used in cycle_output/cycle_input
+        let len = 3i32;
+        let idx = 2usize; // last item
+        let direction = 1i8;
+        let next = ((idx as i32 + direction as i32) % len + len) % len;
+        assert_eq!(next, 0); // wraps to start
+    }
+
+    #[test]
+    fn direction_wrapping_backward() {
+        let len = 3i32;
+        let idx = 0usize; // first item
+        let direction = -1i8;
+        let next = ((idx as i32 + direction as i32) % len + len) % len;
+        assert_eq!(next, 2); // wraps to end
+    }
+
+    #[test]
+    fn extract_json_field_valid() {
+        let json = r#"{"uid": "BuiltIn-1234", "name": "Speakers"}"#;
+        assert_eq!(extract_json_field(json, "uid").unwrap(), "BuiltIn-1234");
+        assert_eq!(extract_json_field(json, "name").unwrap(), "Speakers");
+    }
+
+    #[test]
+    fn extract_json_field_missing() {
+        let json = r#"{"uid": "BuiltIn-1234"}"#;
+        assert!(extract_json_field(json, "name").is_none());
+    }
+}

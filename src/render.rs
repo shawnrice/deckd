@@ -946,3 +946,81 @@ fn shorten_device_name(name: &str) -> String {
         name.into()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_hex_valid_color() {
+        let c = parse_hex("#FF8800");
+        assert_eq!(c, Rgba([255, 136, 0, 255]));
+    }
+
+    #[test]
+    fn parse_hex_no_hash() {
+        let c = parse_hex("00FF00");
+        assert_eq!(c, Rgba([0, 255, 0, 255]));
+    }
+
+    #[test]
+    fn parse_hex_short_falls_back_to_white() {
+        let c = parse_hex("#FFF");
+        assert_eq!(c, Rgba([255, 255, 255, 255]));
+    }
+
+    #[test]
+    fn parse_hex_black() {
+        let c = parse_hex("#000000");
+        assert_eq!(c, Rgba([0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_long_string_adds_dots() {
+        let result = truncate("a very long string here", 10);
+        assert!(result.len() <= 12); // 9 chars + ".."
+        assert!(result.ends_with(".."));
+    }
+
+    #[test]
+    fn truncate_exact_length_unchanged() {
+        assert_eq!(truncate("12345", 5), "12345");
+    }
+
+    #[test]
+    fn shorten_device_name_macbook_speakers() {
+        assert_eq!(shorten_device_name("MacBook Pro Speakers"), "Speakers");
+    }
+
+    #[test]
+    fn shorten_device_name_hyperx() {
+        assert_eq!(shorten_device_name("HyperX Cloud II Wireless"), "HyperX");
+    }
+
+    #[test]
+    fn shorten_device_name_benq() {
+        assert_eq!(shorten_device_name("BenQ EW3270U"), "BenQ");
+    }
+
+    #[test]
+    fn shorten_device_name_zoom() {
+        assert_eq!(shorten_device_name("ZoomAudioDevice"), "Zoom");
+    }
+
+    #[test]
+    fn shorten_device_name_long_unknown() {
+        let result = shorten_device_name("VeryLongDeviceName");
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 13);
+    }
+
+    #[test]
+    fn shorten_device_name_short_passthrough() {
+        assert_eq!(shorten_device_name("AirPods"), "AirPods");
+    }
+}

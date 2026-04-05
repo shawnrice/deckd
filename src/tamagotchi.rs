@@ -494,3 +494,126 @@ impl Pet {
 pub fn new_shared(name: &str) -> SharedPet {
     Arc::new(Mutex::new(Pet::load_or_new(name)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_pet_defaults() {
+        let p = Pet::new("testy");
+        assert_eq!(p.name, "testy");
+        assert_eq!(p.species, Species::Cat);
+        assert_eq!(p.level, 1);
+        assert_eq!(p.xp, 0);
+    }
+
+    #[test]
+    fn feed_reduces_hunger_increases_happiness_and_xp() {
+        let mut p = Pet::new("testy");
+        p.hunger = 50;
+        p.happiness = 50;
+        p.xp = 0;
+        p.feed();
+        assert_eq!(p.hunger, 20);      // 50 - 30
+        assert_eq!(p.happiness, 60);    // 50 + 10
+        assert_eq!(p.xp, 10);
+        assert_eq!(p.action, Action::Eating);
+    }
+
+    #[test]
+    fn feed_clamps_hunger_at_zero() {
+        let mut p = Pet::new("testy");
+        p.hunger = 10;
+        p.feed();
+        assert_eq!(p.hunger, 0);
+    }
+
+    #[test]
+    fn ship_pr_gives_50_xp_and_celebrates() {
+        let mut p = Pet::new("testy");
+        p.xp = 0;
+        p.ship_pr();
+        assert_eq!(p.xp, 50);
+        assert_eq!(p.action, Action::Celebrating);
+        assert_eq!(p.mood, Mood::Excited);
+    }
+
+    #[test]
+    fn level_up_at_xp_thresholds() {
+        let mut p = Pet::new("testy");
+        p.xp = 90;
+        p.happiness = 50;
+        p.feed(); // +10 xp → 100 total → level 2
+        assert_eq!(p.level, 2);
+    }
+
+    #[test]
+    fn species_evolution_at_level_5() {
+        let mut p = Pet::new("testy");
+        p.xp = 399;
+        p.level = 4;
+        p.feed(); // xp=409, level=5
+        assert_eq!(p.level, 5);
+        assert_eq!(p.species, Species::Dog);
+    }
+
+    #[test]
+    fn species_evolution_at_level_10() {
+        let mut p = Pet::new("testy");
+        p.xp = 899;
+        p.level = 9;
+        p.feed(); // xp=909, level=10
+        assert_eq!(p.level, 10);
+        assert_eq!(p.species, Species::Penguin);
+    }
+
+    #[test]
+    fn species_evolution_at_level_20() {
+        let mut p = Pet::new("testy");
+        p.xp = 1899;
+        p.level = 19;
+        p.feed(); // xp=1909, level=20
+        assert_eq!(p.level, 20);
+        assert_eq!(p.species, Species::Ghost);
+    }
+
+    #[test]
+    fn hunger_increases_on_tick() {
+        let mut p = Pet::new("testy");
+        p.hunger = 10;
+        // Force tick by backdating last_update
+        p.last_update = Instant::now() - std::time::Duration::from_secs(5);
+        p.tick();
+        assert_eq!(p.hunger, 11);
+    }
+
+    #[test]
+    fn mood_reflects_stats() {
+        let mut p = Pet::new("testy");
+        p.last_update = Instant::now() - std::time::Duration::from_secs(5);
+
+        // Hungry mood when hunger > 80
+        p.hunger = 90;
+        p.energy = 80;
+        p.happiness = 50;
+        p.tick();
+        assert_eq!(p.mood, Mood::Hungry);
+
+        // Sleeping mood when energy < 20
+        p.energy = 10;
+        p.hunger = 50;
+        p.last_update = Instant::now() - std::time::Duration::from_secs(5);
+        p.tick();
+        assert_eq!(p.mood, Mood::Sleeping);
+    }
+
+    #[test]
+    fn pet_increases_happiness() {
+        let mut p = Pet::new("testy");
+        p.happiness = 50;
+        p.pet();
+        assert_eq!(p.happiness, 55);
+        assert_eq!(p.xp, 2);
+    }
+}

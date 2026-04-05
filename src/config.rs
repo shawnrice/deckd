@@ -164,3 +164,132 @@ pub fn load(path: &PathBuf) -> Result<Config, Box<dyn std::error::Error>> {
     let config: Config = toml::from_str(&content)?;
     Ok(config)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_minimal_config() {
+        let toml = r#"
+            brightness = 80
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.brightness, Some(80));
+        assert!(cfg.buttons.is_empty());
+        assert!(cfg.pages.is_empty());
+    }
+
+    #[test]
+    fn start_page_defaults_to_main() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.start_page(), "main");
+    }
+
+    #[test]
+    fn start_page_uses_configured_value() {
+        let toml = r#"default_page = "tools""#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.start_page(), "tools");
+    }
+
+    #[test]
+    fn active_buttons_falls_back_to_top_level() {
+        let toml = r#"
+            [buttons.b1]
+            label = "Top"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let btns = cfg.active_buttons("nonexistent_page");
+        assert!(btns.contains_key("b1"));
+        assert_eq!(btns["b1"].label.as_deref(), Some("Top"));
+    }
+
+    #[test]
+    fn active_buttons_uses_page_when_present() {
+        let toml = r#"
+            [buttons.b1]
+            label = "Top"
+
+            [pages.tools.buttons.b1]
+            label = "Page"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let btns = cfg.active_buttons("tools");
+        assert_eq!(btns["b1"].label.as_deref(), Some("Page"));
+    }
+
+    #[test]
+    fn active_encoders_falls_back_when_page_encoders_empty() {
+        let toml = r#"
+            [encoders.e1]
+            label = "Vol"
+
+            [pages.tools]
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let enc = cfg.active_encoders("tools");
+        assert!(enc.contains_key("e1"));
+    }
+
+    #[test]
+    fn parse_multi_action() {
+        let toml = r#"
+            [buttons.b1]
+            label = "Multi"
+            [buttons.b1.on_press]
+            type = "multi"
+            [[buttons.b1.on_press.actions]]
+            type = "shell"
+            command = "echo hello"
+            [[buttons.b1.on_press.actions]]
+            type = "url"
+            url = "https://example.com"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let action = cfg.buttons["b1"].on_press.as_ref().unwrap();
+        match action {
+            Action::Multi { actions } => assert_eq!(actions.len(), 2),
+            _ => panic!("expected Multi action"),
+        }
+    }
+
+    #[test]
+    fn parse_light_preset_with_group() {
+        let toml = r#"
+            [buttons.b1]
+            label = "Meeting"
+            [buttons.b1.on_press]
+            type = "light_preset"
+            brightness = 70
+            temp_k = 5000
+            group = "keylights"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        match cfg.buttons["b1"].on_press.as_ref().unwrap() {
+            Action::LightPreset { brightness, temp_k, group } => {
+                assert_eq!(*brightness, 70);
+                assert_eq!(*temp_k, 5000);
+                assert_eq!(group.as_deref(), Some("keylights"));
+            }
+            _ => panic!("expected LightPreset action"),
+        }
+    }
+
+    #[test]
+    fn parse_audio_device_list() {
+        let toml = r#"
+            [[output_devices]]
+            uid = "BuiltInSpeaker"
+            name = "Speakers"
+
+            [[output_devices]]
+            uid = "HyperX-1234"
+            name = "HyperX"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.output_devices.len(), 2);
+        assert_eq!(cfg.output_devices[0].name, "Speakers");
+        assert_eq!(cfg.output_devices[1].uid, "HyperX-1234");
+    }
+}
