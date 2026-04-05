@@ -780,7 +780,9 @@ fn start_daemon() {
             lcd_refresh_interval
         };
 
-        if last_lcd_refresh.elapsed() >= refresh_interval {
+        if ble_pending.is_some() {
+            // BLE scan still running — boot animation owns the LCD, skip dashboard rendering
+        } else if last_lcd_refresh.elapsed() >= refresh_interval {
             // Clean up stale notifications + feed pet from GitHub events
             if let Ok(mut s) = dash_state.lock() {
                 if let Ok(mut p) = pet_state.lock() {
