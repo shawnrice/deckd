@@ -10,6 +10,7 @@ mod gcal;
 mod notify;
 mod render;
 mod soundboard;
+mod sysmon;
 mod tamagotchi;
 mod timer;
 
@@ -293,7 +294,7 @@ fn start_daemon() {
 
     // Start dashboard background poller
     let dash_state = dashboard::new_shared();
-    dashboard::start_poller(Arc::clone(&dash_state), cfg.github_repo.clone());
+    dashboard::start_poller(Arc::clone(&dash_state), cfg.github_repo.clone(), cfg.monitoring.clone());
 
     // Camera state
     let mut cam_state = camera::CameraState::new();
@@ -331,7 +332,7 @@ fn start_daemon() {
     let lcd_refresh_interval = std::time::Duration::from_secs(5);
 
     // Page list for swipe navigation
-    let swipe_pages = ["main", "tools", "ship"];
+    let swipe_pages = ["main", "tools", "monitor", "ship"];
 
     // Track timer expiry to play sound once
     let mut timer_was_expired = false;
@@ -623,6 +624,10 @@ fn start_daemon() {
                 if let Ok(dash) = dash_state.lock() {
                     let encoders = cfg.active_encoders(&current_page);
                     render::render_lcd_dashboard(&mut deck, encoders, &dash, &timer_state, &pet_state);
+                }
+            } else if current_page == "monitor" {
+                if let Ok(dash) = dash_state.lock() {
+                    render::render_monitor_lcd(&mut deck, &dash);
                 }
             } else if is_pet_page {
                 // Full-width pet scene on configured pages

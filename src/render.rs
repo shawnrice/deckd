@@ -377,6 +377,209 @@ pub fn render_lcd_dashboard(
     }
 }
 
+/// Render the monitor page LCD with system stats
+pub fn render_monitor_lcd(deck: &mut StreamDeck, dashboard: &DashboardState) {
+    // Check for active notifications first
+    let notification_duration = std::time::Duration::from_secs(5);
+    if let Some(notif) = dashboard.notifications.last()
+        && notif.created.elapsed() < notification_duration
+    {
+        render_notification_banner(deck, &notif.message, notif.created);
+        return;
+    }
+
+    let seg_w = 200_u32;
+    let strip_h = 100_u32;
+
+    // Segment 0: CPU + Memory
+    {
+        let img = render_monitor_segment_cpu_mem(
+            dashboard.cpu_load,
+            dashboard.memory_percent,
+            seg_w,
+            strip_h,
+        );
+        write_lcd_segment(deck, 0, &img, seg_w);
+    }
+
+    // Segment 1: Containers
+    {
+        let img = render_monitor_segment_containers(
+            dashboard.containers_running,
+            &dashboard.containers_unhealthy,
+            seg_w,
+            strip_h,
+        );
+        write_lcd_segment(deck, 1, &img, seg_w);
+    }
+
+    // Segment 2: Network latency
+    {
+        let img = render_monitor_segment_network(dashboard.network_latency_ms, seg_w, strip_h);
+        write_lcd_segment(deck, 2, &img, seg_w);
+    }
+
+    // Segment 3: Uptime
+    {
+        let val = dashboard.uptime_hours
+            .map(|h| {
+                if h >= 24 {
+                    format!("{}d {}h", h / 24, h % 24)
+                } else {
+                    format!("{}h", h)
+                }
+            });
+        let img = render_lcd_segment("Uptime", val.as_deref(), seg_w, strip_h);
+        write_lcd_segment(deck, 3, &img, seg_w);
+    }
+}
+
+fn render_monitor_segment_cpu_mem(
+    cpu_load: Option<f32>,
+    memory_percent: Option<u8>,
+    width: u32,
+    height: u32,
+) -> RgbaImage {
+    let bg = Rgba([12, 12, 20, 255]);
+    let mut img = RgbaImage::from_pixel(width, height, bg);
+
+    let f = font();
+    let fb = font_bold();
+
+    // Separator
+    let sep = Rgba([40, 40, 55, 255]);
+    draw_filled_rect_mut(&mut img, Rect::at(width as i32 - 1, 8).of_size(1, height - 16), sep);
+
+    // CPU load
+    let cpu_text = cpu_load.map(|l| format!("{:.1}", l)).unwrap_or_else(|| "---".into());
+    let cpu_color = match cpu_load {
+        Some(l) if l > 4.0 => Rgba([255, 80, 80, 255]),   // red when high
+        Some(l) if l > 2.0 => Rgba([255, 200, 60, 255]),  // yellow when moderate
+        _ => Rgba([255, 255, 255, 255]),
+    };
+
+    let label_scale = PxScale::from(14.0);
+    let val_scale = PxScale::from(24.0);
+
+    draw_text_mut(&mut img, Rgba([120, 120, 150, 255]), 8, 6, label_scale, &f, "CPU");
+    draw_text_mut(&mut img, cpu_color, 8, 18, val_scale, &fb, &cpu_text);
+
+    // Memory bar
+    let mem_text = memory_percent.map(|m| format!("{}%", m)).unwrap_or_else(|| "---".into());
+    draw_text_mut(&mut img, Rgba([120, 120, 150, 255]), 8, 50, label_scale, &f, "MEM");
+    draw_text_mut(&mut img, Rgba([255, 255, 255, 255]), 50, 50, label_scale, &fb, &mem_text);
+
+    // Tiny memory bar
+    if let Some(pct) = memory_percent {
+        let bar_w = (width - 16) as i32;
+        let bar_h = 6_u32;
+        let bar_y = 72;
+        let filled = (pct as i32 * bar_w / 100).max(1);
+        let bar_color = if pct > 90 {
+            Rgba([255, 80, 80, 255])
+        } else if pct > 75 {
+            Rgba([255, 200, 60, 255])
+        } else {
+            Rgba([80, 200, 120, 255])
+        };
+        draw_filled_rect_mut(&mut img, Rect::at(8, bar_y).of_size(bar_w as u32, bar_h), Rgba([30, 30, 45, 255]));
+        draw_filled_rect_mut(&mut img, Rect::at(8, bar_y).of_size(filled as u32, bar_h), bar_color);
+    }
+
+    img
+}
+
+fn render_monitor_segment_containers(
+    running: Option<u32>,
+    unhealthy: &[String],
+    width: u32,
+    height: u32,
+) -> RgbaImage {
+    let bg = Rgba([12, 12, 20, 255]);
+    let mut img = RgbaImage::from_pixel(width, height, bg);
+
+    let f = font();
+    let fb = font_bold();
+
+    // Separator
+    let sep = Rgba([40, 40, 55, 255]);
+    draw_filled_rect_mut(&mut img, Rect::at(width as i32 - 1, 8).of_size(1, height - 16), sep);
+
+    let label_scale = PxScale::from(14.0);
+    draw_text_mut(&mut img, Rgba([120, 120, 150, 255]), 8, 6, label_scale, &f, "Containers");
+
+    match running {
+        Some(count) => {
+            let val_scale = PxScale::from(28.0);
+            let count_str = count.to_string();
+            draw_text_mut(&mut img, Rgba([255, 255, 255, 255]), 8, 22, val_scale, &fb, &count_str);
+
+            let running_label_x = 8 + text_width(&count_str, &fb, val_scale) as i32 + 6;
+            draw_text_mut(&mut img, Rgba([120, 120, 150, 255]), running_label_x, 32, label_scale, &f, "running");
+
+            if !unhealthy.is_empty() {
+                let warn_text = format!("{} unhealthy", unhealthy.len());
+                let small_scale = PxScale::from(14.0);
+                draw_text_mut(&mut img, Rgba([255, 80, 80, 255]), 8, 60, small_scale, &fb, &warn_text);
+                // Show first unhealthy name if space allows
+                if let Some(name) = unhealthy.first() {
+                    let short = truncate(name, 18);
+                    draw_text_mut(&mut img, Rgba([255, 120, 120, 255]), 8, 76, PxScale::from(12.0), &f, &short);
+                }
+            }
+        }
+        None => {
+            let val_scale = PxScale::from(20.0);
+            draw_text_mut(&mut img, Rgba([100, 100, 130, 255]), 8, 36, val_scale, &f, "N/A");
+        }
+    }
+
+    img
+}
+
+fn render_monitor_segment_network(
+    latency_ms: Option<u32>,
+    width: u32,
+    height: u32,
+) -> RgbaImage {
+    let bg = Rgba([12, 12, 20, 255]);
+    let mut img = RgbaImage::from_pixel(width, height, bg);
+
+    let f = font();
+    let fb = font_bold();
+
+    // Separator
+    let sep = Rgba([40, 40, 55, 255]);
+    draw_filled_rect_mut(&mut img, Rect::at(width as i32 - 1, 8).of_size(1, height - 16), sep);
+
+    let label_scale = PxScale::from(14.0);
+    draw_text_mut(&mut img, Rgba([120, 120, 150, 255]), 8, 6, label_scale, &f, "Network");
+
+    match latency_ms {
+        Some(ms) => {
+            let val_scale = PxScale::from(32.0);
+            let text = format!("{}ms", ms);
+            let color = if ms > 100 {
+                Rgba([255, 200, 60, 255])
+            } else {
+                Rgba([80, 200, 120, 255])
+            };
+            let tw = text_width(&text, &fb, val_scale);
+            let x = ((width as f32 - tw) / 2.0).max(4.0) as i32;
+            draw_text_mut(&mut img, color, x, 30, val_scale, &fb, &text);
+        }
+        None => {
+            let val_scale = PxScale::from(32.0);
+            let text = "DOWN";
+            let tw = text_width(text, &fb, val_scale);
+            let x = ((width as f32 - tw) / 2.0).max(4.0) as i32;
+            draw_text_mut(&mut img, Rgba([255, 60, 60, 255]), x, 30, val_scale, &fb, text);
+        }
+    }
+
+    img
+}
+
 fn write_lcd_segment(deck: &mut StreamDeck, idx: u8, img: &RgbaImage, segment_width: u32) {
     let x_offset = idx as u16 * segment_width as u16;
     let dyn_img = DynamicImage::ImageRgba8(img.clone());

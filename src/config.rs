@@ -16,6 +16,9 @@ pub struct Config {
     pub github_repo: Option<String>,
 
     #[serde(default)]
+    pub monitoring: MonitoringConfig,
+
+    #[serde(default)]
     pub output_devices: Vec<AudioDevice>,
 
     #[serde(default)]
@@ -131,6 +134,16 @@ pub enum Action {
 pub struct AudioDevice {
     pub uid: String,
     pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MonitoringConfig {
+    /// Enable CPU/memory monitoring
+    pub system_stats: Option<bool>,
+    /// Enable Docker/Podman container monitoring
+    pub containers: Option<bool>,
+    /// Host to ping for network latency (e.g. "1.1.1.1")
+    pub network_ping: Option<String>,
 }
 
 pub fn resolve_config_path() -> PathBuf {
@@ -291,5 +304,39 @@ mod tests {
         assert_eq!(cfg.output_devices.len(), 2);
         assert_eq!(cfg.output_devices[0].name, "Speakers");
         assert_eq!(cfg.output_devices[1].uid, "HyperX-1234");
+    }
+
+    #[test]
+    fn parse_monitoring_config_defaults() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(cfg.monitoring.system_stats, None);
+        assert_eq!(cfg.monitoring.containers, None);
+        assert_eq!(cfg.monitoring.network_ping, None);
+    }
+
+    #[test]
+    fn parse_monitoring_config_full() {
+        let toml = r#"
+            [monitoring]
+            system_stats = true
+            containers = true
+            network_ping = "1.1.1.1"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.monitoring.system_stats, Some(true));
+        assert_eq!(cfg.monitoring.containers, Some(true));
+        assert_eq!(cfg.monitoring.network_ping, Some("1.1.1.1".into()));
+    }
+
+    #[test]
+    fn parse_monitoring_config_partial() {
+        let toml = r#"
+            [monitoring]
+            system_stats = true
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.monitoring.system_stats, Some(true));
+        assert_eq!(cfg.monitoring.containers, None);
+        assert_eq!(cfg.monitoring.network_ping, None);
     }
 }

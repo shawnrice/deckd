@@ -1,9 +1,13 @@
+use std::collections::HashSet;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
+
+use crate::config::MonitoringConfig;
+use crate::sysmon;
 
 /// Shared dashboard state updated by the background poller
 #[derive(Debug, Clone)]
@@ -49,6 +53,17 @@ pub struct DashboardState {
 
     // Notifications — set when values change, cleared after display
     pub notifications: Vec<Notification>,
+
+    // CI failure tracking — PR numbers we've already notified about
+    pub notified_ci_failures: HashSet<u32>,
+
+    // System monitoring
+    pub cpu_load: Option<f32>,
+    pub memory_percent: Option<u8>,
+    pub containers_running: Option<u32>,
+    pub containers_unhealthy: Vec<String>,
+    pub network_latency_ms: Option<u32>,
+    pub uptime_hours: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +99,13 @@ impl DashboardState {
             audio_suppress_until: Instant::now(),
             input_flash: None,
             notifications: Vec::new(),
+            notified_ci_failures: HashSet::new(),
+            cpu_load: None,
+            memory_percent: None,
+            containers_running: None,
+            containers_unhealthy: Vec::new(),
+            network_latency_ms: None,
+            uptime_hours: None,
         }
     }
 }
@@ -136,17 +158,21 @@ pub fn mark_audio_changed(state: &SharedDashboard) {
 }
 
 /// Start the background dashboard poller thread
-pub fn start_poller(state: SharedDashboard, github_repo: Option<String>) {
+pub fn start_poller(state: SharedDashboard, github_repo: Option<String>, monitoring: MonitoringConfig) {
     thread::spawn(move || {
         // Immediate poll
         poll_audio(&state);
         poll_github(&state, github_repo.as_deref());
         poll_calendar(&state);
+        poll_sysmon(&state, &monitoring);
 
         let mut last_audio = Instant::now();
         let mut last_meeting_detect = Instant::now();
         let mut last_github = Instant::now();
         let mut last_meeting = Instant::now();
+        let mut last_sysmon = Instant::now();
+        let mut last_containers = Instant::now();
+        let mut last_network = Instant::now();
 
         loop {
             thread::sleep(Duration::from_secs(2));
@@ -173,6 +199,24 @@ pub fn start_poller(state: SharedDashboard, github_repo: Option<String>) {
             if last_github.elapsed() >= Duration::from_secs(90) {
                 poll_github(&state, github_repo.as_deref());
                 last_github = Instant::now();
+            }
+
+            // System stats: every 10 seconds (lightweight)
+            if last_sysmon.elapsed() >= Duration::from_secs(10) {
+                poll_sysmon(&state, &monitoring);
+                last_sysmon = Instant::now();
+            }
+
+            // Containers: every 30 seconds
+            if last_containers.elapsed() >= Duration::from_secs(30) {
+                poll_containers(&state, &monitoring);
+                last_containers = Instant::now();
+            }
+
+            // Network ping: every 30 seconds
+            if last_network.elapsed() >= Duration::from_secs(30) {
+                poll_network(&state, &monitoring);
+                last_network = Instant::now();
             }
         }
     });
@@ -239,7 +283,7 @@ fn poll_github(state: &SharedDashboard, repo: Option<&str>) {
 
     // Single combined GraphQL query — fast, avoids timeouts from gh pr list
     let query = format!(r#"query {{
-  myOpenPRs: search(query: "repo:{repo} is:pr is:open author:@me", type: ISSUE, first: 1) {{
+  myOpenPRs: search(query: "repo:{repo} is:pr is:open author:@me", type: ISSUE, first: 10) {{
     issueCount
     nodes {{
       ... on PullRequest {{
@@ -299,7 +343,9 @@ fn poll_github(state: &SharedDashboard, repo: Option<&str>) {
     else "review"
     end
   ),
-  latestChecks: (.data.myOpenPRs.nodes[0].commits.nodes[0].commit.statusCheckRollup.state // "unknown")
+  latestChecks: (.data.myOpenPRs.nodes[0].commits.nodes[0].commit.statusCheckRollup.state // "unknown"),
+  ciFailures: [.data.myOpenPRs.nodes[] | select(.commits.nodes[0].commit.statusCheckRollup.state == "FAILURE") | {number, title}],
+  ciSuccesses: [.data.myOpenPRs.nodes[] | select(.commits.nodes[0].commit.statusCheckRollup.state == "SUCCESS") | {number}]
 }"#;
 
     let output = Command::new("gh")
@@ -330,7 +376,37 @@ fn poll_github(state: &SharedDashboard, repo: Option<&str>) {
     let latest_status = extract_json_string(&json, "latestStatus").unwrap_or_default();
     let latest_checks = extract_json_string(&json, "latestChecks").unwrap_or_default();
 
+    // Parse CI failures and successes for notification tracking
+    let ci_failures = extract_json_pr_list(&json, "ciFailures");
+    let ci_successes = extract_json_pr_numbers(&json, "ciSuccesses");
+
     if let Ok(mut s) = state.lock() {
+        // CI failure notifications — only notify once per PR
+        for (pr_num, pr_title) in &ci_failures {
+            if !s.notified_ci_failures.contains(pr_num) {
+                s.notified_ci_failures.insert(*pr_num);
+                s.notifications.push(Notification {
+                    message: format!("CI failing on #{}: {}", pr_num, truncate_str(pr_title, 30)),
+                    created: Instant::now(),
+                });
+            }
+        }
+
+        // CI fixed notifications — when a previously-failing PR is now SUCCESS
+        let failure_numbers: HashSet<u32> = ci_failures.iter().map(|(n, _)| *n).collect();
+        let fixed: Vec<u32> = s.notified_ci_failures
+            .iter()
+            .filter(|n| ci_successes.contains(n) && !failure_numbers.contains(n))
+            .copied()
+            .collect();
+        for pr_num in &fixed {
+            s.notified_ci_failures.remove(pr_num);
+            s.notifications.push(Notification {
+                message: format!("CI fixed on #{}", pr_num),
+                created: Instant::now(),
+            });
+        }
+
         // Detect changes and create notifications
         if review_requests > s.review_requests && s.review_requests > 0 {
             let delta = review_requests - s.review_requests;
@@ -511,6 +587,144 @@ end tell"#)
             }
         }
         s.in_meeting = in_meeting;
+    }
+}
+
+/// Truncate a string (for notification messages)
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max - 1).collect();
+        format!("{}...", truncated)
+    }
+}
+
+/// Extract a list of (number, title) pairs from a JSON array like `"ciFailures": [{...}, ...]`
+fn extract_json_pr_list(json: &str, key: &str) -> Vec<(u32, String)> {
+    let pattern = format!("\"{}\":", key);
+    let Some(start) = json.find(&pattern) else { return Vec::new() };
+    let rest = &json[start + pattern.len()..];
+    let Some(arr_start) = rest.find('[') else { return Vec::new() };
+    let rest = &rest[arr_start..];
+
+    // Find matching closing bracket
+    let mut depth = 0;
+    let mut end = 0;
+    for (i, c) in rest.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if end == 0 {
+        return Vec::new();
+    }
+    let arr_str = &rest[..end];
+
+    // Simple extraction of {number, title} objects
+    let mut results = Vec::new();
+    let mut pos = 0;
+    while let Some(obj_start) = arr_str[pos..].find('{') {
+        let abs_start = pos + obj_start;
+        if let Some(obj_end) = arr_str[abs_start..].find('}') {
+            let obj = &arr_str[abs_start..abs_start + obj_end + 1];
+            let num = extract_json_number(obj, "number");
+            let title = extract_json_string(obj, "title").unwrap_or_default();
+            if let Some(n) = num {
+                results.push((n, title));
+            }
+            pos = abs_start + obj_end + 1;
+        } else {
+            break;
+        }
+    }
+    results
+}
+
+/// Extract PR numbers from a JSON array like `"ciSuccesses": [{"number":123}, ...]`
+fn extract_json_pr_numbers(json: &str, key: &str) -> HashSet<u32> {
+    extract_json_pr_list(json, key)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect()
+}
+
+fn poll_sysmon(state: &SharedDashboard, monitoring: &MonitoringConfig) {
+    if monitoring.system_stats.unwrap_or(false) {
+        let cpu = sysmon::poll_cpu_load();
+        let mem = sysmon::poll_memory();
+        let uptime = sysmon::poll_uptime();
+
+        if let Ok(mut s) = state.lock() {
+            // Notify on high CPU load
+            if let Some(load) = cpu {
+                if load > 4.0 && s.cpu_load.map(|prev| prev <= 4.0).unwrap_or(true) {
+                    s.notifications.push(Notification {
+                        message: format!("High CPU load: {:.1}", load),
+                        created: Instant::now(),
+                    });
+                }
+            }
+            s.cpu_load = cpu;
+            s.memory_percent = mem;
+            s.uptime_hours = uptime;
+        }
+    }
+}
+
+fn poll_containers(state: &SharedDashboard, monitoring: &MonitoringConfig) {
+    if !monitoring.containers.unwrap_or(false) {
+        return;
+    }
+
+    let (running, unhealthy) = sysmon::poll_containers();
+
+    if let Ok(mut s) = state.lock() {
+        // Notify on newly unhealthy containers
+        for name in &unhealthy {
+            if !s.containers_unhealthy.contains(name) {
+                s.notifications.push(Notification {
+                    message: format!("Container unhealthy: {}", name),
+                    created: Instant::now(),
+                });
+            }
+        }
+        s.containers_running = running;
+        s.containers_unhealthy = unhealthy;
+    }
+}
+
+fn poll_network(state: &SharedDashboard, monitoring: &MonitoringConfig) {
+    let Some(ref host) = monitoring.network_ping else {
+        return;
+    };
+
+    let latency = sysmon::poll_network_latency(host);
+
+    if let Ok(mut s) = state.lock() {
+        // Notify when network goes down or comes back
+        let was_up = s.network_latency_ms.is_some();
+        let is_up = latency.is_some();
+
+        if was_up && !is_up {
+            s.notifications.push(Notification {
+                message: "Network down!".into(),
+                created: Instant::now(),
+            });
+        } else if !was_up && is_up && s.network_latency_ms.is_none() {
+            // Only notify recovery if we previously had a value (not first poll)
+            // This is intentionally skipping first-poll recovery
+        }
+
+        s.network_latency_ms = latency;
     }
 }
 
