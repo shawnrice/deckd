@@ -293,7 +293,7 @@ fn start_daemon() {
 
     // Start dashboard background poller
     let dash_state = dashboard::new_shared();
-    dashboard::start_poller(Arc::clone(&dash_state));
+    dashboard::start_poller(Arc::clone(&dash_state), cfg.github_repo.clone());
 
     // Camera state
     let mut cam_state = camera::CameraState::new();
@@ -421,7 +421,7 @@ fn start_daemon() {
                             p.pet();
                         }
                     } else if current_page == "main" {
-                        handle_lcd_double_tap(segment, &dash_state);
+                        handle_lcd_double_tap(segment, &dash_state, cfg.github_repo.as_deref());
                     }
                 }
                 deck::InputResult::SwipePage(direction) => {
@@ -465,15 +465,16 @@ fn start_daemon() {
             }
         }
 
-        // React to audio device changes (headphones plugged in, etc.)
+        // React to audio device changes (headphones plugged in, Zoom starting, etc.)
         if devices_changed.swap(false, Ordering::Relaxed) {
             info!("Audio device change detected, refreshing");
             audio_cycler.refresh(&cfg.output_devices, &cfg.input_devices);
-            // Force dashboard audio re-poll and LCD refresh
             if let Ok(mut s) = dash_state.lock() {
-                s.audio_suppress_until = std::time::Instant::now(); // allow poll
+                s.audio_suppress_until = std::time::Instant::now();
             }
             dashboard::refresh_audio(&dash_state);
+            // Also check meeting state immediately — Zoom creates ZoomAudioDevice
+            dashboard::check_meeting(&dash_state);
             if current_page == "main" {
                 if let Ok(dash) = dash_state.lock() {
                     let encoders = cfg.active_encoders(&current_page);
@@ -774,7 +775,7 @@ fn handle_audio_command(
     }
 }
 
-fn handle_lcd_double_tap(segment: u8, dash_state: &dashboard::SharedDashboard) {
+fn handle_lcd_double_tap(segment: u8, dash_state: &dashboard::SharedDashboard, github_repo: Option<&str>) {
     match segment {
         0 => {
             // Toggle mic mute
@@ -807,11 +808,11 @@ fn handle_lcd_double_tap(segment: u8, dash_state: &dashboard::SharedDashboard) {
                     .arg("Spotify")
                     .spawn()
                     .ok();
-            } else {
+            } else if let Some(repo) = github_repo {
                 let url = if segment == 2 {
-                    "https://github.com/shawnrice/deckd/pulls?q=is%3Apr+is%3Aopen+review-requested%3A%40me"
+                    format!("https://github.com/{}/pulls?q=is%3Apr+is%3Aopen+review-requested%3A%40me", repo)
                 } else {
-                    "https://github.com/shawnrice/deckd/pulls?q=is%3Apr+is%3Aopen+author%3A%40me+review%3Aapproved"
+                    format!("https://github.com/{}/pulls?q=is%3Apr+is%3Aopen+author%3A%40me+review%3Aapproved", repo)
                 };
                 info!("LCD double-tap segment {} → opening URL", segment);
                 std::process::Command::new("open").arg(url).spawn().ok();

@@ -301,8 +301,11 @@ pub fn render_lcd_dashboard(
     let seg_w = 200_u32;
     let strip_h = 100_u32;
 
-    let has_music = dashboard.now_playing_state == "playing"
-        || (dashboard.now_playing_state == "paused" && !dashboard.now_playing_title.is_empty());
+    let paused_recently = dashboard.now_playing_state == "paused"
+        && !dashboard.now_playing_title.is_empty()
+        && dashboard.now_playing_changed.elapsed() < std::time::Duration::from_secs(300);
+
+    let has_music = dashboard.now_playing_state == "playing" || paused_recently;
 
     let timer_display = timer.lock().ok().and_then(|t| {
         if t.is_running() { Some(t.display()) } else { None }

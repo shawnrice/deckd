@@ -12,6 +12,9 @@ pub struct Config {
     #[serde(default)]
     pub pet_pages: Vec<String>,
 
+    /// GitHub repo for dashboard (e.g. "shawnrice/deckd")
+    pub github_repo: Option<String>,
+
     #[serde(default)]
     pub output_devices: Vec<AudioDevice>,
 

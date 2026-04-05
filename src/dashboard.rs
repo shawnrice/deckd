@@ -31,6 +31,7 @@ pub struct DashboardState {
     pub now_playing_title: String,
     pub now_playing_artist: String,
     pub now_playing_state: String,  // "playing", "paused", "none"
+    pub now_playing_changed: Instant, // when state last changed
 
     // Meeting detection
     pub in_meeting: bool,
@@ -75,6 +76,7 @@ impl DashboardState {
             now_playing_title: String::new(),
             now_playing_artist: String::new(),
             now_playing_state: "none".into(),
+            now_playing_changed: Instant::now(),
             in_meeting: false,
             meeting_changed: false,
             audio_updated: Instant::now(),
@@ -94,6 +96,11 @@ pub fn new_shared() -> SharedDashboard {
 
 /// Optimistically adjust volume in the dashboard state without re-polling.
 /// Suppresses background audio poll for 1.5s so it doesn't overwrite.
+/// Force an immediate meeting state check
+pub fn check_meeting(state: &SharedDashboard) {
+    poll_in_meeting(state);
+}
+
 /// Force an immediate audio state re-poll
 pub fn refresh_audio(state: &SharedDashboard) {
     // Temporarily clear suppress so poll_audio runs
@@ -129,14 +136,15 @@ pub fn mark_audio_changed(state: &SharedDashboard) {
 }
 
 /// Start the background dashboard poller thread
-pub fn start_poller(state: SharedDashboard) {
+pub fn start_poller(state: SharedDashboard, github_repo: Option<String>) {
     thread::spawn(move || {
         // Immediate poll
         poll_audio(&state);
-        poll_github(&state);
+        poll_github(&state, github_repo.as_deref());
         poll_calendar(&state);
 
         let mut last_audio = Instant::now();
+        let mut last_meeting_detect = Instant::now();
         let mut last_github = Instant::now();
         let mut last_meeting = Instant::now();
 
@@ -146,8 +154,13 @@ pub fn start_poller(state: SharedDashboard) {
             if last_audio.elapsed() >= Duration::from_secs(3) {
                 poll_audio(&state);
                 poll_now_playing(&state);
-                poll_in_meeting(&state);
                 last_audio = Instant::now();
+            }
+
+            // Meeting detection: every 15 seconds (osascript is heavy)
+            if last_meeting_detect.elapsed() >= Duration::from_secs(15) {
+                poll_in_meeting(&state);
+                last_meeting_detect = Instant::now();
             }
 
             // Calendar: poll every 60 seconds via Google Calendar API (no UI, no focus stealing)
@@ -158,7 +171,7 @@ pub fn start_poller(state: SharedDashboard) {
 
             // GitHub: poll every 90 seconds
             if last_github.elapsed() >= Duration::from_secs(90) {
-                poll_github(&state);
+                poll_github(&state, github_repo.as_deref());
                 last_github = Instant::now();
             }
         }
@@ -217,56 +230,60 @@ fn poll_audio(state: &SharedDashboard) {
     }
 }
 
-fn poll_github(state: &SharedDashboard) {
+fn poll_github(state: &SharedDashboard, repo: Option<&str>) {
+    let repo = match repo {
+        Some(r) => r,
+        None => return, // No repo configured, skip GitHub polling
+    };
     debug!("Polling GitHub via GraphQL...");
 
     // Single combined GraphQL query — fast, avoids timeouts from gh pr list
-    let query = r#"query {
-  myOpenPRs: search(query: "repo:shawnrice/deckd is:pr is:open author:@me", type: ISSUE, first: 1) {
+    let query = format!(r#"query {{
+  myOpenPRs: search(query: "repo:{repo} is:pr is:open author:@me", type: ISSUE, first: 1) {{
     issueCount
-    nodes {
-      ... on PullRequest {
+    nodes {{
+      ... on PullRequest {{
         number
         title
         state
         isDraft
         reviewDecision
-        commits(last: 1) {
-          nodes {
-            commit {
-              statusCheckRollup {
+        commits(last: 1) {{
+          nodes {{
+            commit {{
+              statusCheckRollup {{
                 state
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  reviewRequested: search(query: "repo:shawnrice/deckd is:pr is:open review-requested:@me", type: ISSUE, first: 0) {
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+  reviewRequested: search(query: "repo:{repo} is:pr is:open review-requested:@me", type: ISSUE, first: 0) {{
     issueCount
-  }
-  approvedPRs: search(query: "repo:shawnrice/deckd is:pr is:open author:@me review:approved", type: ISSUE, first: 100) {
+  }}
+  approvedPRs: search(query: "repo:{repo} is:pr is:open author:@me review:approved", type: ISSUE, first: 100) {{
     issueCount
-    nodes {
-      ... on PullRequest {
+    nodes {{
+      ... on PullRequest {{
         number
-        commits(last: 1) {
-          nodes {
-            commit {
-              statusCheckRollup {
+        commits(last: 1) {{
+          nodes {{
+            commit {{
+              statusCheckRollup {{
                 state
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  myIssues: search(query: "repo:shawnrice/deckd is:issue is:open assignee:@me", type: ISSUE, first: 0) {
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
+  }}
+  myIssues: search(query: "repo:{repo} is:issue is:open assignee:@me", type: ISSUE, first: 0) {{
     issueCount
-  }
-}"#;
+  }}
+}}"#, repo = repo);
 
     let jq_filter = r#"{
   openPRCount: .data.myOpenPRs.issueCount,
@@ -426,7 +443,11 @@ return "none||""#)
         if parts.len() == 3
             && let Ok(mut s) = state.lock()
         {
-            s.now_playing_state = parts[0].to_string();
+            let new_state = parts[0].to_string();
+            if new_state != s.now_playing_state {
+                s.now_playing_changed = Instant::now();
+            }
+            s.now_playing_state = new_state;
             s.now_playing_title = parts[1].to_string();
             s.now_playing_artist = parts[2].to_string();
         }
