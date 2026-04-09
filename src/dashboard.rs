@@ -665,16 +665,17 @@ fn poll_sysmon(state: &SharedDashboard, monitoring: &MonitoringConfig, boot_time
         let uptime = sysmon::poll_uptime();
 
         if let Ok(mut s) = state.lock() {
-            // Notify on high CPU load (>80% of cores, skip first 60s for wake spike)
+            // Notify when load average exceeds 1.5x core count (sustained overload,
+            // not just normal full utilization). Skip first 60s for wake spike.
             let ncpu = sysmon::cpu_count() as f32;
-            let cpu_threshold = ncpu * 0.8;
+            let cpu_threshold = ncpu * 1.5;
             if let Some(load) = cpu {
                 if load > cpu_threshold
                     && boot_time.elapsed() > Duration::from_secs(60)
                     && s.cpu_load.map(|prev| prev <= cpu_threshold).unwrap_or(true)
                 {
                     s.notifications.push(Notification {
-                        message: format!("High CPU load: {:.1}", load),
+                        message: format!("Load avg {:.1} ({}x cores)", load, (load / ncpu).round() as u32),
                         created: Instant::now(),
                     });
                 }

@@ -18,10 +18,16 @@ pub struct Pet {
     pub xp: u32,
     pub level: u32,
     pub action: Action,  // current idle animation
+    /// Normalized horizontal position (0.0 = left edge, 1.0 = right edge).
+    /// Persists across actions so the pet doesn't teleport when switching animations.
+    pub x_normalized: f32,
+    /// Walking direction: +1 = rightward, -1 = leftward.
+    pub walk_direction: i8,
     frame: u8,
     action_started: Instant,
     action_duration_secs: u32,
     last_update: Instant,
+    last_tick: Instant,
     last_fed: Instant,
     last_pet: Instant,
 }
@@ -251,10 +257,13 @@ impl Pet {
             xp: 0,
             level: 1,
             action: Action::Idle,
+            x_normalized: 0.5, // start centered
+            walk_direction: 1,
             frame: 0,
             action_started: Instant::now(),
             action_duration_secs: 10,
             last_update: Instant::now(),
+            last_tick: Instant::now(),
             last_fed: Instant::now(),
             last_pet: Instant::now(),
         }
@@ -262,6 +271,23 @@ impl Pet {
 
     /// Call every few seconds to update pet state
     pub fn tick(&mut self) {
+        // Advance walking position on every tick for smooth motion.
+        // dt = time since last tick (not since last state update).
+        let dt = self.last_tick.elapsed().as_secs_f32();
+        self.last_tick = Instant::now();
+        if self.action == Action::Walking {
+            // Walk speed: full width in ~6 seconds
+            let speed = 1.0 / 6.0;
+            self.x_normalized += self.walk_direction as f32 * speed * dt;
+            if self.x_normalized >= 1.0 {
+                self.x_normalized = 1.0;
+                self.walk_direction = -1;
+            } else if self.x_normalized <= 0.0 {
+                self.x_normalized = 0.0;
+                self.walk_direction = 1;
+            }
+        }
+
         let elapsed = self.last_update.elapsed().as_secs();
         if elapsed < 3 {
             return;
@@ -302,31 +328,64 @@ impl Pet {
     }
 
     fn pick_new_action(&mut self) {
-        // Use frame as simple pseudo-random
-        let roll = (self.frame.wrapping_mul(7).wrapping_add(13)) % 20;
-        self.action = match roll {
-            0..=4 => Action::Idle,
-            5..=7 => Action::Walking,
-            8..=9 => Action::LookingAround,
-            10..=11 => Action::Dancing,
-            12 => Action::Napping,
-            13..=14 => Action::Typing,
-            _ => Action::Idle,
+        // Mix several varying sources for pseudo-randomness across ticks
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        let seed = now
+            ^ (self.frame as u64).wrapping_mul(2654435761)
+            ^ (self.xp as u64).wrapping_mul(11400714819323198485);
+        let roll = (seed >> 16) % 20;
+
+        // New distribution: more movement, less idle
+        //   Walking: 25% (most common — pet actually moves)
+        //   Idle:    15%
+        //   LookingAround: 15%
+        //   Dancing: 15%
+        //   Typing:  15%
+        //   Napping: 10%
+        //   (plus a repeat chance to vary it)
+        let candidate = match roll {
+            0..=4 => Action::Walking,
+            5..=6 => Action::Idle,
+            7..=9 => Action::LookingAround,
+            10..=12 => Action::Dancing,
+            13..=15 => Action::Typing,
+            16..=17 => Action::Napping,
+            _ => Action::Walking,
         };
+
+        // Avoid repeating the same action twice in a row (unless mood forces it)
+        self.action = if candidate == self.action && candidate != Action::Idle {
+            // Pick a different one deterministically
+            match candidate {
+                Action::Walking => Action::LookingAround,
+                Action::LookingAround => Action::Dancing,
+                Action::Dancing => Action::Walking,
+                Action::Typing => Action::Walking,
+                Action::Napping => Action::Idle,
+                _ => Action::Walking,
+            }
+        } else {
+            candidate
+        };
+
         // Override based on mood
         if self.mood == Mood::Sleeping {
             self.action = Action::Napping;
         } else if self.mood == Mood::Hungry {
             self.action = Action::LookingAround;
         }
+
         self.action_started = Instant::now();
         self.action_duration_secs = match self.action {
-            Action::Walking => 8,
-            Action::Dancing => 6,
-            Action::Napping => 15,
-            Action::LookingAround => 5,
-            Action::Typing => 10,
-            _ => 12,
+            Action::Walking => 6,
+            Action::Dancing => 5,
+            Action::Napping => 12,
+            Action::LookingAround => 4,
+            Action::Typing => 6,
+            _ => 5, // Idle is shorter now so it transitions sooner
         };
     }
 

@@ -32,7 +32,10 @@ pub fn execute(action: &Action) {
 
         Action::Url { url } => {
             info!("Opening URL: {}", url);
+            // -u tells `open` this is a URL, preventing it from re-encoding
+            // already-encoded characters (e.g. %20 → %2520).
             let result = Command::new("open")
+                .arg("-u")
                 .arg(url)
                 .spawn();
 
@@ -82,6 +85,10 @@ pub fn execute(action: &Action) {
 
         Action::LightPreset { brightness, temp_k, .. } => {
             info!("Light preset: brightness={}, temp={}K", brightness, temp_k);
+        }
+
+        Action::BleScan => {
+            info!("BLE rescan requested");
         }
 
         Action::Multi { actions } => {

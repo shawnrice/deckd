@@ -9,6 +9,7 @@ use imageproc::rect::Rect;
 use log::{error, warn};
 
 use crate::config::{ButtonConfig, EncoderConfig};
+use std::collections::HashSet;
 use crate::dashboard::DashboardState;
 use crate::tamagotchi::SharedPet;
 use crate::timer::SharedTimer;
@@ -264,27 +265,9 @@ fn render_lcd_segment(label: &str, value: Option<&str>, width: u32, height: u32)
     img
 }
 
-pub fn render_lcd_strip(deck: &mut StreamDeck, encoders: &HashMap<String, EncoderConfig>) {
-    let segment_width = 200_u32;
-    let strip_height = 100_u32;
-
-    for (key_str, encoder) in encoders {
-        let idx: u8 = match key_str.parse() {
-            Ok(k) if k < 4 => k,
-            _ => continue,
-        };
-
-        if let Some(label) = &encoder.label {
-            let img = render_lcd_segment(label, None, segment_width, strip_height);
-            write_lcd_segment(deck, idx, &img, segment_width);
-        }
-    }
-}
-
-/// Render the LCD strip with live dashboard data
+/// Render the LCD strip with live dashboard data (all 4 segments)
 pub fn render_lcd_dashboard(
     deck: &mut StreamDeck,
-    _encoders: &HashMap<String, EncoderConfig>,
     dashboard: &DashboardState,
     timer: &SharedTimer,
     pet: &SharedPet,
@@ -373,6 +356,125 @@ pub fn render_lcd_dashboard(
             let right = img.view(seg_w, 0, seg_w, strip_h).to_image();
             write_lcd_segment(deck, 2, &left, seg_w);
             write_lcd_segment(deck, 3, &right, seg_w);
+        }
+    }
+}
+
+/// Render only the base-layer dashboard segments, skipping positions owned by overlays.
+/// Overlay-owned segments should be rendered separately as static encoder labels.
+pub fn render_lcd_dashboard_segments(
+    deck: &mut StreamDeck,
+    dashboard: &DashboardState,
+    timer: &SharedTimer,
+    pet: &SharedPet,
+    skip: &HashSet<String>,
+) {
+    // Notifications still take full width even through overlays
+    let notification_duration = std::time::Duration::from_secs(5);
+    if let Some(notif) = dashboard.notifications.last()
+        && notif.created.elapsed() < notification_duration
+    {
+        render_notification_banner(deck, &notif.message, notif.created);
+        return;
+    }
+
+    let seg_w = 200_u32;
+    let strip_h = 100_u32;
+
+    // Segment 0: Volume / Mute
+    if !skip.contains("0") {
+        let (l, v) = if dashboard.mic_muted {
+            ("MUTED", "MIC".to_string())
+        } else {
+            ("Volume", format!("{}%", &dashboard.volume))
+        };
+        let img = render_lcd_segment(l, Some(&v), seg_w, strip_h);
+        write_lcd_segment(deck, 0, &img, seg_w);
+    }
+
+    // Segment 1: Audio device
+    if !skip.contains("1") {
+        let (l, v) = if let Some((ref input_name, when)) = dashboard.input_flash {
+            if when.elapsed() < std::time::Duration::from_secs(2) {
+                ("Input", shorten_device_name(input_name))
+            } else {
+                ("Output", shorten_device_name(&dashboard.audio_output))
+            }
+        } else {
+            ("Output", shorten_device_name(&dashboard.audio_output))
+        };
+        let img = render_lcd_segment(l, Some(&v), seg_w, strip_h);
+        write_lcd_segment(deck, 1, &img, seg_w);
+    }
+
+    // Segments 2-3: treated as a pair (pet/music is 400px wide)
+    let skip_23 = skip.contains("2") || skip.contains("3");
+    if !skip_23 {
+        let paused_recently = dashboard.now_playing_state == "paused"
+            && !dashboard.now_playing_title.is_empty()
+            && dashboard.now_playing_changed.elapsed() < std::time::Duration::from_secs(300);
+        let has_music = dashboard.now_playing_state == "playing" || paused_recently;
+
+        let timer_display = timer.lock().ok().and_then(|t| {
+            if t.is_running() { Some(t.display()) } else { None }
+        });
+
+        if has_music {
+            let is_playing = dashboard.now_playing_state == "playing";
+            let img = render_now_playing(
+                &dashboard.now_playing_title,
+                &dashboard.now_playing_artist,
+                is_playing,
+                seg_w * 2,
+                strip_h,
+            );
+            let left = img.view(0, 0, seg_w, strip_h).to_image();
+            let right = img.view(seg_w, 0, seg_w, strip_h).to_image();
+            write_lcd_segment(deck, 2, &left, seg_w);
+            write_lcd_segment(deck, 3, &right, seg_w);
+        } else {
+            let info_text = if let Some(ref time_str) = timer_display {
+                Some(format!("⏱ {}", time_str))
+            } else if dashboard.next_meeting_mins >= 0 && dashboard.next_meeting_mins <= 60 {
+                Some(format!("{} in {}m", truncate(&dashboard.next_meeting, 12), dashboard.next_meeting_mins))
+            } else if dashboard.review_requests > 0 {
+                Some(format!("{} reviews waiting", dashboard.review_requests))
+            } else if dashboard.mergeable_count > 0 {
+                Some(format!("{} ready to merge", dashboard.mergeable_count))
+            } else {
+                None
+            };
+
+            if let Ok(p) = pet.lock() {
+                let img = render_pet_wide(&p, info_text.as_deref(), seg_w * 2, strip_h);
+                let left = img.view(0, 0, seg_w, strip_h).to_image();
+                let right = img.view(seg_w, 0, seg_w, strip_h).to_image();
+                write_lcd_segment(deck, 2, &left, seg_w);
+                write_lcd_segment(deck, 3, &right, seg_w);
+            }
+        }
+    }
+}
+
+/// Render static encoder labels for the given positions
+pub fn render_overlay_encoder_labels(
+    deck: &mut StreamDeck,
+    encoders: &HashMap<String, EncoderConfig>,
+    positions: &HashSet<String>,
+) {
+    let seg_w = 200_u32;
+    let strip_h = 100_u32;
+
+    for pos in positions {
+        let idx: u8 = match pos.parse() {
+            Ok(k) if k < 4 => k,
+            _ => continue,
+        };
+        if let Some(enc) = encoders.get(pos) {
+            if let Some(label) = &enc.label {
+                let img = render_lcd_segment(label, None, seg_w, strip_h);
+                write_lcd_segment(deck, idx, &img, seg_w);
+            }
         }
     }
 }
@@ -792,26 +894,33 @@ fn render_pet_wide(
         Rgba([30, 30, 50, 255]),
     );
 
-    // Pet position — moves based on action
-    let _frame = pet.sprite().len() as i32; // use sprite len as frame proxy
+    // Pet position uses persistent normalized x (0.0 = left, 1.0 = right)
+    // from the Pet state, so walking position survives across action changes.
+    // Dancing and LookingAround add small local jitter on top of home position.
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let padding = 40_i32;
+    let min_x = padding;
+    let max_x = width as i32 - padding;
+    let range = (max_x - min_x).max(1);
+
+    let home_x = min_x + (pet.x_normalized.clamp(0.0, 1.0) * range as f32) as i32;
+
     let base_x = match pet.action {
-        Action::Walking => {
-            let cycle = (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() / 400) as i32;
-            let range = (width as i32 / 2) - 40; // use most of the available width
-            let center = width as i32 / 4;
-            center + ((cycle % 16) - 8).abs() * range / 8
-        }
         Action::Dancing => {
-            let cycle = (std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() / 300) as i32;
-            160 + (cycle % 4 - 2) * 8 // small bounce
+            // Side-to-side dance around home position
+            let cycle = (millis / 200) as i32;
+            let amp = 12_i32;
+            home_x + (cycle % 4 - 2) * amp / 2
         }
-        _ => 160, // centered-ish
+        Action::LookingAround => {
+            // Small shuffles around home
+            let cycle = (millis / 600) as i32;
+            home_x + (cycle % 5 - 2) * 4
+        }
+        _ => home_x,
     };
 
     let blink = (std::time::SystemTime::now()
@@ -868,7 +977,7 @@ fn render_pet_wide(
                 // Pupils — look direction based on action
                 let pupil_offset = match pet.action {
                     Action::LookingAround => if blink % 6 < 3 { -1 } else { 1 },
-                    Action::Walking => if cx > 200 { 1 } else { -1 },
+                    Action::Walking => pet.walk_direction as i32,
                     _ => 0,
                 };
                 draw_filled_circle_mut(&mut img, (cx - 5 + pupil_offset, cy - 15), 1, Rgba([255, 255, 255, 255]));

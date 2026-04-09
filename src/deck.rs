@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use elgato_streamdeck::{StreamDeck, StreamDeckInput, list_devices, new_hidapi};
-use log::{debug, info};
+use log::{debug, info, warn};
 
 use crate::actions;
 use crate::config::{Action, Config};
@@ -14,6 +14,7 @@ pub enum InputResult {
     ActionFired(Action),
     LcdDoubleTap(u8),
     TimerCommand(String),
+    BleScan,
     /// Swipe direction: negative = right (previous page), positive = left (next page)
     SwipePage(i8),
 }
@@ -28,6 +29,29 @@ pub fn connect() -> Result<StreamDeck, Box<dyn std::error::Error>> {
 
     let (kind, serial) = &devices[0];
     info!("Found device: {:?} (serial: {})", kind, serial);
+
+    // Disable firmware idle sleep timer before opening the main connection.
+    // The Stream Deck Plus sleeps after ~10min of no button presses, causing
+    // HID read failures that look like a disconnect. Sending feature report
+    // [0x03, 0x0D, 0x00...] sets the sleep timeout to 0 (disabled).
+    // We open a temporary HID handle for this since StreamDeck::connect
+    // doesn't expose the raw HidDevice.
+    {
+        match hidapi.open_serial(kind.vendor_id(), kind.product_id(), serial) {
+            Ok(raw_device) => {
+                let mut buf = [0u8; 32];
+                buf[0] = 0x03; // Report ID
+                buf[1] = 0x0D; // Command: set sleep timeout
+                // bytes 2-5 are 0x00 (INT32 LE = 0 seconds = disabled)
+                match raw_device.send_feature_report(&buf) {
+                    Ok(()) => info!("Firmware sleep timer disabled"),
+                    Err(e) => warn!("Failed to disable sleep timer: {}", e),
+                }
+            }
+            Err(e) => warn!("Failed to open raw HID for sleep config: {}", e),
+        }
+        // raw_device is dropped here, releasing the HID handle
+    }
 
     let deck = StreamDeck::connect(&hidapi, *kind, serial)?;
     Ok(deck)
@@ -50,6 +74,7 @@ fn handle_action(action: &Action) -> Option<InputResult> {
             None
         }
         Action::Timer { command } => Some(InputResult::TimerCommand(command.clone())),
+        Action::BleScan => Some(InputResult::BleScan),
         Action::Multi { actions } => {
             // Execute all actions, return the last special result (page switch, etc.)
             let mut last_result = None;
@@ -94,7 +119,7 @@ impl TouchState {
 pub fn poll_and_dispatch(
     deck: &StreamDeck,
     cfg: &Config,
-    current_page: &str,
+    page_stack: &[String],
     error_count: &mut u32,
     touch: &mut TouchState,
 ) -> Result<Option<InputResult>, ()> {
@@ -103,8 +128,11 @@ pub fn poll_and_dispatch(
             *error_count = 0;
             input
         }
-        Err(_) => {
+        Err(e) => {
             *error_count += 1;
+            if *error_count == 1 {
+                log::warn!("Stream Deck read error: {}", e);
+            }
             if *error_count > 20 {
                 // 20 consecutive errors (~1 second) = device is gone
                 log::error!("Stream Deck disconnected (20 consecutive read failures), exiting for restart");
@@ -114,8 +142,8 @@ pub fn poll_and_dispatch(
         }
     };
 
-    let buttons = cfg.active_buttons(current_page);
-    let encoders = cfg.active_encoders(current_page);
+    let buttons = cfg.resolved_buttons(page_stack);
+    let encoders = cfg.resolved_encoders(page_stack);
 
     let result = match input {
         StreamDeckInput::NoData => None,

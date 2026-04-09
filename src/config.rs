@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -38,21 +38,51 @@ pub struct Config {
 }
 
 impl Config {
-    /// Returns the active page's buttons, falling back to top-level buttons
-    pub fn active_buttons<'a>(&'a self, page: &str) -> &'a HashMap<String, ButtonConfig> {
-        self.pages
-            .get(page)
-            .map(|p| &p.buttons)
-            .unwrap_or(&self.buttons)
+    /// Resolve buttons by walking the layer stack bottom-to-top.
+    /// Higher layers override lower layers per-position.
+    pub fn resolved_buttons(&self, stack: &[String]) -> HashMap<String, ButtonConfig> {
+        let mut merged = self.buttons.clone(); // top-level as base
+        for page_name in stack {
+            if let Some(page) = self.pages.get(page_name) {
+                for (key, btn) in &page.buttons {
+                    merged.insert(key.clone(), btn.clone());
+                }
+            }
+        }
+        merged
     }
 
-    /// Returns the active page's encoders, falling back to top-level encoders
-    pub fn active_encoders<'a>(&'a self, page: &str) -> &'a HashMap<String, EncoderConfig> {
-        self.pages
-            .get(page)
-            .map(|p| &p.encoders)
-            .filter(|e| !e.is_empty())
-            .unwrap_or(&self.encoders)
+    /// Resolve encoders by walking the layer stack bottom-to-top.
+    /// Higher layers override lower layers per-position.
+    pub fn resolved_encoders(&self, stack: &[String]) -> HashMap<String, EncoderConfig> {
+        let mut merged = self.encoders.clone(); // top-level as base
+        for page_name in stack {
+            if let Some(page) = self.pages.get(page_name) {
+                for (key, enc) in &page.encoders {
+                    merged.insert(key.clone(), enc.clone());
+                }
+            }
+        }
+        merged
+    }
+
+    /// Returns encoder positions defined by overlay layers (everything above the base).
+    /// Used for LCD dispatch: overlay positions get static labels, base positions get
+    /// live dashboard content.
+    pub fn overlay_encoder_positions(&self, stack: &[String]) -> HashSet<String> {
+        let mut positions = HashSet::new();
+        // Skip the base layer (first element), collect labelled encoders from overlays.
+        // Unlabelled overlay encoders fall through to the dashboard for that segment.
+        for page_name in stack.iter().skip(1) {
+            if let Some(page) = self.pages.get(page_name) {
+                for (key, enc) in &page.encoders {
+                    if enc.label.is_some() {
+                        positions.insert(key.clone());
+                    }
+                }
+            }
+        }
+        positions
     }
 
     pub fn start_page(&self) -> String {
@@ -128,6 +158,9 @@ pub enum Action {
         temp_k: u16,
         group: Option<String>,
     },
+
+    #[serde(rename = "ble_scan")]
+    BleScan,
 
     #[serde(rename = "multi")]
     Multi { actions: Vec<Action> },
@@ -210,33 +243,58 @@ mod tests {
     }
 
     #[test]
-    fn active_buttons_falls_back_to_top_level() {
+    fn resolved_buttons_falls_back_to_top_level() {
         let toml = r#"
             [buttons.b1]
             label = "Top"
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        let btns = cfg.active_buttons("nonexistent_page");
+        let stack = vec!["nonexistent_page".into()];
+        let btns = cfg.resolved_buttons(&stack);
         assert!(btns.contains_key("b1"));
         assert_eq!(btns["b1"].label.as_deref(), Some("Top"));
     }
 
     #[test]
-    fn active_buttons_uses_page_when_present() {
+    fn resolved_buttons_overlay_overrides_base() {
         let toml = r#"
             [buttons.b1]
             label = "Top"
 
+            [pages.main.buttons.b1]
+            label = "Base"
+
             [pages.tools.buttons.b1]
-            label = "Page"
+            label = "Overlay"
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        let btns = cfg.active_buttons("tools");
-        assert_eq!(btns["b1"].label.as_deref(), Some("Page"));
+        let stack = vec!["main".into(), "tools".into()];
+        let btns = cfg.resolved_buttons(&stack);
+        assert_eq!(btns["b1"].label.as_deref(), Some("Overlay"));
     }
 
     #[test]
-    fn active_encoders_falls_back_when_page_encoders_empty() {
+    fn resolved_buttons_fallthrough_to_lower_layer() {
+        let toml = r#"
+            [pages.main.buttons.b1]
+            label = "Base"
+
+            [pages.main.buttons.b2]
+            label = "Base B2"
+
+            [pages.tools.buttons.b1]
+            label = "Overlay"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let stack = vec!["main".into(), "tools".into()];
+        let btns = cfg.resolved_buttons(&stack);
+        // b1 comes from tools (overlay), b2 falls through to main (base)
+        assert_eq!(btns["b1"].label.as_deref(), Some("Overlay"));
+        assert_eq!(btns["b2"].label.as_deref(), Some("Base B2"));
+    }
+
+    #[test]
+    fn resolved_encoders_falls_back_when_page_empty() {
         let toml = r#"
             [encoders.e1]
             label = "Vol"
@@ -244,8 +302,35 @@ mod tests {
             [pages.tools]
         "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        let enc = cfg.active_encoders("tools");
+        let stack = vec!["tools".into()];
+        let enc = cfg.resolved_encoders(&stack);
         assert!(enc.contains_key("e1"));
+    }
+
+    #[test]
+    fn overlay_encoder_positions_skips_base() {
+        let toml = r#"
+            [pages.main.encoders.0]
+            label = "Vol"
+            [pages.main.encoders.1]
+            label = "Audio"
+            [pages.main.encoders.2]
+            label = "Light"
+            [pages.main.encoders.3]
+            label = "Temp"
+
+            [pages.keylights.encoders.0]
+            label = "Brightness"
+            [pages.keylights.encoders.1]
+            label = "Color"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let stack = vec!["main".into(), "keylights".into()];
+        let overlay = cfg.overlay_encoder_positions(&stack);
+        assert!(overlay.contains("0"));
+        assert!(overlay.contains("1"));
+        assert!(!overlay.contains("2"));
+        assert!(!overlay.contains("3"));
     }
 
     #[test]

@@ -397,10 +397,12 @@ fn start_daemon() {
     // ── Boot + discovery ──────────────────────────────────────────
     // Check if we're restarting after a sleep/wake (stamp file < 30s old)
     let stamp_path = "/tmp/deckd.last_run";
-    let is_restart = std::fs::metadata(stamp_path)
+    let stamp_age = std::fs::metadata(stamp_path)
         .and_then(|m| m.modified())
-        .map(|t| t.elapsed().unwrap_or_default() < std::time::Duration::from_secs(30))
-        .unwrap_or(false);
+        .ok()
+        .and_then(|t| t.elapsed().ok());
+    let is_restart = stamp_age.map(|age| age < std::time::Duration::from_secs(30)).unwrap_or(false);
+    info!("Stamp age: {:?}, is_restart: {}", stamp_age, is_restart);
     // Touch the stamp file
     std::fs::write(stamp_path, "").ok();
 
@@ -464,12 +466,14 @@ fn start_daemon() {
     let boot_start = Instant::now();
 
     // Render buttons immediately — interactive before BLE scan finishes
-    let mut current_page = cfg.start_page();
-    let buttons = cfg.active_buttons(&current_page);
-    render::render_buttons(&mut deck, buttons);
+    let mut page_stack: Vec<String> = vec![cfg.start_page()];
+    let buttons = cfg.resolved_buttons(&page_stack);
+    render::render_buttons(&mut deck, &buttons);
 
-    // Startup sound
-    soundboard::play_named("success");
+    // Startup sound (skip on quick restarts to avoid noise on USB hub resets)
+    if !is_restart {
+        soundboard::play_named("success");
+    }
     // LCD stays showing boot animation until BLE scan completes (or dashboard takes over)
 
     // Track when we last refreshed the LCD dashboard
@@ -492,17 +496,62 @@ fn start_daemon() {
     let mut read_errors = 0u32;
     let mut touch_state = deck::TouchState::new();
     let mut ble_pending = ble_rx;
+    let mut is_booting = ble_pending.is_some();
+    // Sleep/wake detection: compare wall-clock delta across iterations.
+    // If wall clock jumps forward much more than the loop period, we slept.
+    let mut last_wake_check = std::time::SystemTime::now();
     while !shutdown.load(Ordering::Relaxed) {
+        // Detect wake from sleep: wall-clock gap >> loop iteration time
+        if let Ok(elapsed) = std::time::SystemTime::now().duration_since(last_wake_check) {
+            if elapsed > std::time::Duration::from_secs(10) {
+                info!("Detected wake from sleep (gap: {:?}), refreshing deck state", elapsed);
+                // Re-render current page buttons — the Stream Deck firmware
+                // blanks button images during macOS sleep.
+                render_page(&mut deck, &cfg, &page_stack);
+                // Re-apply stateful button overrides for the current page
+                let cp = current_page(&page_stack);
+                if cp == "keylights" {
+                    render::render_light_toggle_button(&mut deck, lights::keylights_on(&all_lights));
+                } else if cp == "desklights" {
+                    render::render_light_toggle_button(&mut deck, lights::desklights_on(&all_lights));
+                } else if cp == "meeting" {
+                    let muted = dash_state.lock().map(|s| s.mic_muted).unwrap_or(false);
+                    render::render_mic_button(&mut deck, muted);
+                } else if cp == "cam_settings" {
+                    cam_state.sync_from_device();
+                    render::render_camera_state_buttons(&mut deck, &cam_state);
+                }
+                // Force LCD refresh next tick
+                last_lcd_refresh = Instant::now() - lcd_refresh_interval;
+                // Restore brightness (in case firmware dimmed it)
+                deck.set_brightness(cfg.brightness.unwrap_or(80)).ok();
+            }
+        }
+        last_wake_check = std::time::SystemTime::now();
+
         // Check if BLE scan completed in background
         if let Some(ref rx) = ble_pending {
             if let Ok(ble_lights) = rx.try_recv() {
-                info!("BLE scan complete: {} light(s)", ble_lights.len());
-                all_lights.extend(ble_lights);
+                // Dedup: skip lights already connected (by name)
+                let existing_names: Vec<String> = all_lights.iter().map(|l| l.name.clone()).collect();
+                let new_lights: Vec<_> = ble_lights
+                    .into_iter()
+                    .filter(|l| !existing_names.contains(&l.name))
+                    .collect();
+                let new_count = new_lights.len();
+                all_lights.extend(new_lights);
                 ble_pending = None;
-                boot::render_boot_complete(&mut deck, all_lights.len());
+
+                if is_booting {
+                    info!("BLE scan complete: {} light(s)", all_lights.len());
+                    boot::render_boot_complete(&mut deck, all_lights.len());
+                    is_booting = false;
+                } else {
+                    info!("BLE rescan complete: {} new light(s) ({} total)", new_count, all_lights.len());
+                }
                 last_lcd_refresh = Instant::now() - lcd_refresh_interval;
-            } else {
-                // Still scanning — animate boot progress on LCD
+            } else if is_booting {
+                // Still scanning at boot — animate boot progress on LCD
                 let elapsed = boot_start.elapsed().as_secs_f32();
                 let progress = (0.3 + elapsed / 8.0).min(0.95);
                 let dots = match (elapsed as u32) % 4 {
@@ -515,7 +564,7 @@ fn start_daemon() {
             }
         }
 
-        let poll_result = deck::poll_and_dispatch(&deck, &cfg, &current_page, &mut read_errors, &mut touch_state);
+        let poll_result = deck::poll_and_dispatch(&deck, &cfg, &page_stack, &mut read_errors, &mut touch_state);
         if poll_result.is_err() {
             break;
         }
@@ -523,21 +572,22 @@ fn start_daemon() {
             match result {
                 deck::InputResult::SwitchPage(new_page) => {
                     info!("Switching to page: {}", new_page);
-                    current_page = new_page;
-                    render_page(&mut deck, &cfg, &current_page);
+                    push_page(&mut page_stack, new_page);
+                    render_page(&mut deck, &cfg, &page_stack);
+                    let cp = current_page(&page_stack);
                     // Sync camera state when entering camera settings page
-                    if current_page == "cam_settings" {
+                    if cp == "cam_settings" {
                         cam_state.sync_from_device();
                         render::render_camera_state_buttons(&mut deck, &cam_state);
                     }
                     // Render stateful light toggle on entry
-                    if current_page == "keylights" {
+                    if cp == "keylights" {
                         render::render_light_toggle_button(&mut deck, lights::keylights_on(&all_lights));
-                    } else if current_page == "desklights" {
+                    } else if cp == "desklights" {
                         render::render_light_toggle_button(&mut deck, lights::desklights_on(&all_lights));
                     }
                     // Render stateful mic button on meeting page entry
-                    if current_page == "meeting" {
+                    if cp == "meeting" {
                         let muted = dash_state.lock().map(|s| s.mic_muted).unwrap_or(false);
                         render::render_mic_button(&mut deck, muted);
                     }
@@ -549,71 +599,88 @@ fn start_daemon() {
                         continue;
                     }
                     handle_light_command(&mut all_lights, &cmd, &rt);
-                    // Re-render stateful light toggle on keylights/desklights pages
-                    if current_page == "keylights" {
+                    let cp = current_page(&page_stack);
+                    if cp == "keylights" {
                         render::render_light_toggle_button(&mut deck, lights::keylights_on(&all_lights));
-                    } else if current_page == "desklights" {
+                    } else if cp == "desklights" {
                         render::render_light_toggle_button(&mut deck, lights::desklights_on(&all_lights));
+                    }
+                }
+                deck::InputResult::BleScan => {
+                    if ble_pending.is_some() {
+                        info!("BLE scan already in progress, ignoring");
+                    } else {
+                        info!("Starting BLE rescan...");
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("tokio runtime");
+                            let ble_lights = lights::discover_ble(&rt);
+                            tx.send(ble_lights).ok();
+                        });
+                        ble_pending = Some(rx);
                     }
                 }
                 deck::InputResult::CameraCommand(cmd) => {
                     handle_camera_command(&mut cam_state, &cmd);
-                    // Re-render stateful buttons on camera pages
-                    if current_page == "cam_settings" {
+                    if current_page(&page_stack) == "cam_settings" {
                         render::render_camera_state_buttons(&mut deck, &cam_state);
                     }
                 }
                 deck::InputResult::AudioCommand(cmd, amount) => {
                     handle_audio_command(&dash_state, &cmd, amount, &mut audio_cycler);
-                    // Re-render mic button on meeting page after mic toggle
-                    if cmd == "mic_toggle" && current_page == "meeting" {
+                    let cp = current_page(&page_stack);
+                    if cmd == "mic_toggle" && cp == "meeting" {
                         let muted = dash_state.lock().map(|s| s.mic_muted).unwrap_or(false);
                         render::render_mic_button(&mut deck, muted);
                     }
-                    // Instant LCD refresh
-                    if current_page == "main" {
+                    // Instant LCD refresh on base page
+                    if cp == cfg.start_page() {
                         if let Ok(dash) = dash_state.lock() {
-                            let encoders = cfg.active_encoders(&current_page);
-                            render::render_lcd_dashboard(&mut deck, encoders, &dash, &timer_state, &pet_state);
+                            render::render_lcd_dashboard(&mut deck, &dash, &timer_state, &pet_state);
                         }
                         last_lcd_refresh = Instant::now();
                     }
                 }
                 deck::InputResult::ActionFired(ref action) => {
-                    if current_page == "main" {
+                    let cp = current_page(&page_stack);
+                    if cp == cfg.start_page() {
                         apply_optimistic_update(&dash_state, action);
                         if let Ok(dash) = dash_state.lock() {
-                            let encoders = cfg.active_encoders(&current_page);
-                            render::render_lcd_dashboard(&mut deck, encoders, &dash, &timer_state, &pet_state);
+                            render::render_lcd_dashboard(&mut deck, &dash, &timer_state, &pet_state);
                         }
                         last_lcd_refresh = Instant::now();
                     }
                 }
                 deck::InputResult::LcdDoubleTap(segment) => {
-                    let is_pet_pg = cfg.pet_pages.iter().any(|p| p == &current_page);
+                    let cp = current_page(&page_stack);
+                    let is_pet_pg = cfg.pet_pages.iter().any(|p| p == cp);
                     if is_pet_pg {
-                        // On pet pages, any tap pets the pet
                         if let Ok(mut p) = pet_state.lock() {
                             p.pet();
                         }
-                    } else if current_page == "main" {
+                    } else if cp == cfg.start_page() {
                         handle_lcd_double_tap(segment, &dash_state, cfg.github_repo.as_deref());
                     }
                 }
                 deck::InputResult::SwipePage(direction) => {
-                    let current_idx = swipe_pages.iter().position(|&p| p == current_page);
+                    let cp = current_page(&page_stack);
+                    let current_idx = swipe_pages.iter().position(|&p| p == cp);
                     let new_page = match current_idx {
                         Some(idx) => {
                             let len = swipe_pages.len() as i32;
                             let new_idx = ((idx as i32 + direction as i32) % len + len) % len;
                             swipe_pages[new_idx as usize].to_string()
                         }
-                        None => "main".to_string(), // Not in swipe list, go home
+                        None => cfg.start_page(),
                     };
-                    if new_page != current_page {
+                    if new_page != cp {
                         info!("Swipe → page: {}", new_page);
-                        current_page = new_page;
-                        render_page(&mut deck, &cfg, &current_page);
+                        // Swipe resets the stack — lands on a root page
+                        page_stack = vec![new_page];
+                        render_page(&mut deck, &cfg, &page_stack);
                         last_lcd_refresh = Instant::now() - lcd_refresh_interval;
                     }
                 }
@@ -651,10 +718,9 @@ fn start_daemon() {
             dashboard::refresh_audio(&dash_state);
             // Also check meeting state immediately — Zoom creates ZoomAudioDevice
             dashboard::check_meeting(&dash_state);
-            if current_page == "main" {
+            if current_page(&page_stack) == cfg.start_page() {
                 if let Ok(dash) = dash_state.lock() {
-                    let encoders = cfg.active_encoders(&current_page);
-                    render::render_lcd_dashboard(&mut deck, encoders, &dash, &timer_state, &pet_state);
+                    render::render_lcd_dashboard(&mut deck, &dash, &timer_state, &pet_state);
                 }
                 last_lcd_refresh = Instant::now();
             }
@@ -685,7 +751,7 @@ fn start_daemon() {
                     cfg = new_cfg;
                     info!("Config reloaded from {}", config_path.display());
                     audio_cycler.refresh(&cfg.output_devices, &cfg.input_devices);
-                    render_page(&mut deck, &cfg, &current_page);
+                    render_page(&mut deck, &cfg, &page_stack);
                     last_lcd_refresh = Instant::now() - lcd_refresh_interval;
 
                     if let Ok(mut s) = dash_state.lock() {
@@ -720,25 +786,24 @@ fn start_daemon() {
                 let in_meeting = s.in_meeting;
                 drop(s);
 
-                if in_meeting && current_page == "main" {
-                    // Auto-enter meeting mode
+                let cp = current_page(&page_stack);
+                if in_meeting && cp == cfg.start_page() {
+                    // Auto-enter meeting mode — replaces stack
                     info!("Auto-entering meeting mode");
-                    // Set light presets
                     handle_light_command(&mut all_lights, "preset:70:5000:keylights", &rt);
                     handle_light_command(&mut all_lights, "preset:30:5000:desklights", &rt);
-                    current_page = "meeting".into();
-                    render_page(&mut deck, &cfg, &current_page);
-                    // Render stateful mic button
+                    page_stack = vec![cfg.start_page(), "meeting".into()];
+                    render_page(&mut deck, &cfg, &page_stack);
                     let muted = dash_state.lock().map(|s| s.mic_muted).unwrap_or(false);
                     render::render_mic_button(&mut deck, muted);
                     last_lcd_refresh = Instant::now() - lcd_refresh_interval;
-                } else if !in_meeting && current_page == "meeting" {
-                    // Auto-exit meeting mode
+                } else if !in_meeting && cp == "meeting" {
+                    // Auto-exit meeting mode — back to base
                     info!("Auto-exiting meeting mode");
                     handle_light_command(&mut all_lights, "preset:50:4400:keylights", &rt);
                     handle_light_command(&mut all_lights, "preset:50:4400:desklights", &rt);
-                    current_page = "main".into();
-                    render_page(&mut deck, &cfg, &current_page);
+                    page_stack = vec![cfg.start_page()];
+                    render_page(&mut deck, &cfg, &page_stack);
                     last_lcd_refresh = Instant::now() - lcd_refresh_interval;
                 }
             }
@@ -765,23 +830,32 @@ fn start_daemon() {
             timer_was_expired = expired;
         }
 
-        let is_pet_page = cfg.pet_pages.iter().any(|p| p == &current_page);
+        let cp = current_page(&page_stack);
+        let base_page = cfg.start_page();
+        let is_pet_page = cfg.pet_pages.iter().any(|p| p == cp);
+        let overlay_positions = cfg.overlay_encoder_positions(&page_stack);
+        let has_overlay = !overlay_positions.is_empty();
         let pet_animating = pet_state.lock().ok()
             .map(|p| p.action != crate::tamagotchi::Action::Idle && p.action != crate::tamagotchi::Action::Napping)
             .unwrap_or(false);
+        // Pet may show via fallthrough on overlay pages (in base-layer segments 2-3)
+        let pet_visible = is_pet_page
+            || (has_overlay && !overlay_positions.contains("2") && !overlay_positions.contains("3"));
 
         let refresh_interval = if has_notification {
             std::time::Duration::from_millis(150)
         } else if timer_active {
             std::time::Duration::from_millis(500)
-        } else if pet_animating || is_pet_page {
+        } else if pet_animating && (pet_visible || cp == base_page) {
             std::time::Duration::from_millis(400) // Smooth pet animation
+        } else if is_pet_page {
+            std::time::Duration::from_millis(400)
         } else {
             lcd_refresh_interval
         };
 
-        if ble_pending.is_some() {
-            // BLE scan still running — boot animation owns the LCD, skip dashboard rendering
+        if ble_pending.is_some() && is_booting {
+            // Boot scan still running — boot animation owns the LCD, skip dashboard rendering
         } else if last_lcd_refresh.elapsed() >= refresh_interval {
             // Clean up stale notifications + feed pet from GitHub events
             if let Ok(mut s) = dash_state.lock() {
@@ -800,19 +874,28 @@ fn start_daemon() {
                 s.notifications.retain(|n| n.created.elapsed() < std::time::Duration::from_secs(6));
             }
 
-            if current_page == "main" {
+            if cp == base_page {
+                // Base page: full dashboard
                 if let Ok(dash) = dash_state.lock() {
-                    let encoders = cfg.active_encoders(&current_page);
-                    render::render_lcd_dashboard(&mut deck, encoders, &dash, &timer_state, &pet_state);
+                    render::render_lcd_dashboard(&mut deck, &dash, &timer_state, &pet_state);
                 }
-            } else if current_page == "monitor" {
+            } else if cp == "monitor" {
                 if let Ok(dash) = dash_state.lock() {
                     render::render_monitor_lcd(&mut deck, &dash);
                 }
             } else if is_pet_page {
-                // Full-width pet scene on configured pages
+                // Explicit full-width pet page
                 if let Ok(p) = pet_state.lock() {
                     render::render_pet_lcd(&mut deck, &p, 800, 100);
+                }
+            } else {
+                // Overlay page: static labels for overlay positions, dashboard for the rest
+                let resolved = cfg.resolved_encoders(&page_stack);
+                render::render_overlay_encoder_labels(&mut deck, &resolved, &overlay_positions);
+                if let Ok(dash) = dash_state.lock() {
+                    render::render_lcd_dashboard_segments(
+                        &mut deck, &dash, &timer_state, &pet_state, &overlay_positions,
+                    );
                 }
             }
             last_lcd_refresh = Instant::now();
@@ -820,6 +903,7 @@ fn start_daemon() {
     }
 
     info!("deckd shutting down");
+    std::fs::write(stamp_path, "").ok(); // Update stamp so next start detects quick restart
     if let Ok(p) = pet_state.lock() {
         p.save();
     }
@@ -828,18 +912,27 @@ fn start_daemon() {
     deck.flush().ok();
 }
 
-fn render_page(deck: &mut elgato_streamdeck::StreamDeck, cfg: &config::Config, page: &str) {
-    let buttons = cfg.active_buttons(page);
-    render::render_buttons(deck, buttons);
-    // LCD strip is rendered by the main loop's refresh cycle
-    // (dashboard, pet, monitor, or boot animation depending on page/state)
-    // Only render static encoder labels for pages that don't have live LCD content
-    if page != "main" && page != "monitor" {
-        let encoders = cfg.active_encoders(page);
-        if !encoders.is_empty() {
-            render::render_lcd_strip(deck, encoders);
+/// Push a page onto the layer stack. If the page is already in the stack,
+/// truncate to it (prevents cycles, like browser history).
+fn push_page(stack: &mut Vec<String>, page: String) {
+    if let Some(idx) = stack.iter().position(|p| p == &page) {
+        stack.truncate(idx + 1);
+    } else {
+        stack.push(page);
+        if stack.len() > 8 {
+            stack.drain(..stack.len() - 8);
         }
     }
+}
+
+fn current_page(stack: &[String]) -> &str {
+    stack.last().map(|s| s.as_str()).unwrap_or("main")
+}
+
+fn render_page(deck: &mut elgato_streamdeck::StreamDeck, cfg: &config::Config, stack: &[String]) {
+    let buttons = cfg.resolved_buttons(stack);
+    render::render_buttons(deck, &buttons);
+    // LCD is handled entirely by the main loop's refresh cycle
 }
 
 fn handle_light_command(
@@ -1047,5 +1140,59 @@ fn apply_optimistic_update(state: &dashboard::SharedDashboard, action: &config::
         } else if command.contains("SwitchAudioSource -n") {
             dashboard::mark_audio_changed(state);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_page_simple_push() {
+        let mut stack = vec!["main".into()];
+        push_page(&mut stack, "tools".into());
+        assert_eq!(stack, vec!["main", "tools"]);
+    }
+
+    #[test]
+    fn push_page_truncates_on_cycle() {
+        let mut stack = vec!["main".into(), "tools".into(), "keylights".into()];
+        push_page(&mut stack, "main".into());
+        assert_eq!(stack, vec!["main"]);
+    }
+
+    #[test]
+    fn push_page_truncates_to_mid_stack() {
+        let mut stack = vec!["main".into(), "tools".into(), "keylights".into()];
+        push_page(&mut stack, "tools".into());
+        assert_eq!(stack, vec!["main", "tools"]);
+    }
+
+    #[test]
+    fn push_page_noop_for_current() {
+        let mut stack = vec!["main".into(), "tools".into()];
+        push_page(&mut stack, "tools".into());
+        assert_eq!(stack, vec!["main", "tools"]);
+    }
+
+    #[test]
+    fn push_page_depth_cap() {
+        let mut stack: Vec<String> = (0..8).map(|i| format!("p{}", i)).collect();
+        push_page(&mut stack, "p8".into());
+        assert_eq!(stack.len(), 8);
+        assert_eq!(stack.last().unwrap(), "p8");
+        assert_eq!(stack.first().unwrap(), "p1"); // p0 was drained
+    }
+
+    #[test]
+    fn current_page_returns_last() {
+        let stack = vec!["main".into(), "tools".into()];
+        assert_eq!(current_page(&stack), "tools");
+    }
+
+    #[test]
+    fn current_page_empty_stack_defaults() {
+        let stack: Vec<String> = vec![];
+        assert_eq!(current_page(&stack), "main");
     }
 }
