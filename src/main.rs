@@ -889,10 +889,15 @@ fn start_daemon() {
                     render::render_pet_lcd(&mut deck, &p, 800, 100);
                 }
             } else {
-                // Overlay page: static labels for overlay positions, dashboard for the rest
+                // Overlay page: static labels for overlay positions, dashboard for the rest.
+                // When a notification banner is active, skip the overlay labels — otherwise
+                // they paint first and the banner immediately overwrites them, producing a
+                // visible flicker each refresh tick.
                 let resolved = cfg.resolved_encoders(&page_stack);
-                render::render_overlay_encoder_labels(&mut deck, &resolved, &overlay_positions);
                 if let Ok(dash) = dash_state.lock() {
+                    if !dash.notification_active() {
+                        render::render_overlay_encoder_labels(&mut deck, &resolved, &overlay_positions);
+                    }
                     render::render_lcd_dashboard_segments(
                         &mut deck, &dash, &timer_state, &pet_state, &overlay_positions,
                     );

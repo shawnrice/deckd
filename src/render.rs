@@ -272,10 +272,8 @@ pub fn render_lcd_dashboard(
     timer: &SharedTimer,
     pet: &SharedPet,
 ) {
-    // Check for active notifications — render banner if any are fresh (< 5 seconds)
-    let notification_duration = std::time::Duration::from_secs(5);
-    if let Some(notif) = dashboard.notifications.last()
-        && notif.created.elapsed() < notification_duration
+    if dashboard.notification_active()
+        && let Some(notif) = dashboard.notifications.last()
     {
         render_notification_banner(deck, &notif.message, notif.created);
         return;
@@ -370,9 +368,8 @@ pub fn render_lcd_dashboard_segments(
     skip: &HashSet<String>,
 ) {
     // Notifications still take full width even through overlays
-    let notification_duration = std::time::Duration::from_secs(5);
-    if let Some(notif) = dashboard.notifications.last()
-        && notif.created.elapsed() < notification_duration
+    if dashboard.notification_active()
+        && let Some(notif) = dashboard.notifications.last()
     {
         render_notification_banner(deck, &notif.message, notif.created);
         return;
@@ -481,10 +478,8 @@ pub fn render_overlay_encoder_labels(
 
 /// Render the monitor page LCD with system stats
 pub fn render_monitor_lcd(deck: &mut StreamDeck, dashboard: &DashboardState) {
-    // Check for active notifications first
-    let notification_duration = std::time::Duration::from_secs(5);
-    if let Some(notif) = dashboard.notifications.last()
-        && notif.created.elapsed() < notification_duration
+    if dashboard.notification_active()
+        && let Some(notif) = dashboard.notifications.last()
     {
         render_notification_banner(deck, &notif.message, notif.created);
         return;

@@ -72,7 +72,17 @@ pub struct Notification {
     pub created: Instant,
 }
 
+/// How long a notification stays "active" on the LCD banner before it fades out.
+pub const NOTIFICATION_DURATION: Duration = Duration::from_secs(5);
+
 impl DashboardState {
+    /// True when the most recent notification is still within the banner display window.
+    pub fn notification_active(&self) -> bool {
+        self.notifications
+            .last()
+            .is_some_and(|n| n.created.elapsed() < NOTIFICATION_DURATION)
+    }
+
     pub fn new() -> Self {
         Self {
             volume: "?".into(),
