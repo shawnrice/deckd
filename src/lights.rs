@@ -315,6 +315,11 @@ use uuid::Uuid;
 const NEEWER_SERVICE: Uuid = Uuid::from_u128(0x69400001_b5a3_f393_e0a9_e50e24dcca99);
 const NEEWER_WRITE_CHAR: Uuid = Uuid::from_u128(0x69400002_b5a3_f393_e0a9_e50e24dcca99);
 
+/// Timeout for individual BLE writes. CoreBluetooth can wedge for seconds or
+/// forever after sleep/wake cycles; without a bound, a single write can freeze
+/// the main event loop (see `rt.block_on(ble_write(..))` callers).
+const BLE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+
 async fn ble_write(
     peripheral: &btleplug::platform::Peripheral,
     cmd: &[u8],
@@ -325,10 +330,12 @@ async fn ble_write(
         .find(|c| c.uuid == NEEWER_WRITE_CHAR)
         .ok_or("BLE write characteristic not found")?;
 
-    peripheral
-        .write(write_char, cmd, WriteType::WithoutResponse)
-        .await
-        .map_err(|e| format!("BLE write failed: {}", e))
+    let write_fut = peripheral.write(write_char, cmd, WriteType::WithoutResponse);
+    match tokio::time::timeout(BLE_WRITE_TIMEOUT, write_fut).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("BLE write failed: {}", e)),
+        Err(_) => Err(format!("BLE write timed out after {:?}", BLE_WRITE_TIMEOUT)),
+    }
 }
 
 async fn discover_ble_lights() -> Result<Vec<Light>, String> {
