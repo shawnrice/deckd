@@ -583,6 +583,14 @@ fn start_daemon() {
             }
         }
 
+        // BLE keepalive — each Light::ble_heartbeat is a no-op unless the
+        // peripheral has been idle past BLE_HEARTBEAT_INTERVAL, so the hot
+        // path is just a timestamp comparison. Bounded by the 500ms ble_write
+        // timeout, so a wedged peripheral can't stall the main loop.
+        for light in all_lights.iter_mut() {
+            light.ble_heartbeat(&rt);
+        }
+
         let poll_result = deck::poll_and_dispatch(&deck, &cfg, &page_stack, &mut read_errors, &mut touch_state);
         if poll_result.is_err() {
             break;

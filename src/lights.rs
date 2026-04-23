@@ -1,8 +1,8 @@
 use std::io::Write as IoWrite;
 use std::net::UdpSocket;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use log::{info, warn};
+use log::{debug, info, warn};
 
 // ── Protocol (shared across all transports) ─────────────────────
 
@@ -181,6 +181,11 @@ pub fn desklights_on(lights: &[Light]) -> bool {
 enum Transport {
     Ble {
         peripheral: btleplug::platform::Peripheral,
+        /// Timestamp of the last successful write to this peripheral. Used
+        /// by `ble_heartbeat` to decide whether the connection needs a
+        /// keepalive poke. CoreBluetooth and the Neewer firmware both drop
+        /// idle BLE links after ~30s–5min of silence.
+        last_activity: Instant,
     },
     Serial {
         port: Box<dyn serialport::SerialPort>,
@@ -189,9 +194,13 @@ enum Transport {
         socket: UdpSocket,
         broadcast_addr: String,
         handshake: Vec<u8>,
-        last_heartbeat: std::time::Instant,
+        last_heartbeat: Instant,
     },
 }
+
+/// How often we poke idle BLE peripherals with a no-op write to keep the
+/// connection alive. Shorter than the typical BLE idle-disconnect window.
+const BLE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 
 impl Light {
     /// Re-send GL1 handshake if it's been more than 10 seconds since the last one
@@ -211,9 +220,13 @@ impl Light {
         self.state.on = on;
 
         match &mut self.transport {
-            Transport::Ble { peripheral } => {
+            Transport::Ble { peripheral, last_activity } => {
                 let cmd = cmd_power(on); // 78 81 works for all BLE lights
-                rt.block_on(ble_write(peripheral, &cmd))
+                let result = rt.block_on(ble_write(peripheral, &cmd));
+                if result.is_ok() {
+                    *last_activity = Instant::now();
+                }
+                result
             }
             Transport::Serial { port } => {
                 // PL81: use brightness 0/100 since power command is unreliable
@@ -284,9 +297,13 @@ impl Light {
             let brt_cmd = cmd_long_cct_brightness(self.state.brightness);
             let temp_cmd = cmd_long_cct_temp(self.state.color_temp_raw);
             match &mut self.transport {
-                Transport::Ble { peripheral } => {
+                Transport::Ble { peripheral, last_activity } => {
                     rt.block_on(ble_write(peripheral, &brt_cmd))?;
-                    rt.block_on(ble_write(peripheral, &temp_cmd))
+                    let result = rt.block_on(ble_write(peripheral, &temp_cmd));
+                    if result.is_ok() {
+                        *last_activity = Instant::now();
+                    }
+                    result
                 }
                 Transport::Udp { socket, broadcast_addr, .. } => {
                     let cmd = gl1_cmd_cct(self.state.brightness, self.state.color_temp_k);
@@ -298,10 +315,58 @@ impl Light {
             // Standard Neewer BLE CCT
             let cmd = cmd_cct(self.state.brightness, self.state.color_temp_raw);
             match &mut self.transport {
-                Transport::Ble { peripheral } => rt.block_on(ble_write(peripheral, &cmd)),
+                Transport::Ble { peripheral, last_activity } => {
+                    let result = rt.block_on(ble_write(peripheral, &cmd));
+                    if result.is_ok() {
+                        *last_activity = Instant::now();
+                    }
+                    result
+                }
                 Transport::Serial { port } => serial_write(port, &cmd),
                 Transport::Udp { socket, broadcast_addr, .. } => udp_write(socket, broadcast_addr, &cmd),
             }
+        }
+    }
+
+    /// Keepalive for BLE peripherals. If it's been more than
+    /// `BLE_HEARTBEAT_INTERVAL` since the last successful write, re-send the
+    /// current brightness/temp — the same bytes the light already has, so
+    /// there's no visible effect, just enough BLE traffic to reset the idle
+    /// disconnect timer on both sides. No-op for non-BLE transports.
+    pub fn ble_heartbeat(&mut self, rt: &tokio::runtime::Runtime) {
+        // Snapshot the fields we need before we take a mutable borrow on
+        // `self.transport` below — otherwise the borrow checker can't see
+        // that we're reading disjoint fields.
+        let name = &self.name;
+        let is_gl1 = self.is_gl1;
+        let brightness = self.state.brightness;
+        let color_temp_raw = self.state.color_temp_raw;
+
+        let Transport::Ble { peripheral, last_activity } = &mut self.transport else {
+            return;
+        };
+        if last_activity.elapsed() < BLE_HEARTBEAT_INTERVAL {
+            return;
+        }
+
+        debug!("[{}] BLE heartbeat", name);
+        let result: Result<(), String> = if is_gl1 {
+            let brt_cmd = cmd_long_cct_brightness(brightness);
+            let temp_cmd = cmd_long_cct_temp(color_temp_raw);
+            rt.block_on(async {
+                ble_write(peripheral, &brt_cmd).await?;
+                ble_write(peripheral, &temp_cmd).await
+            })
+        } else {
+            let cmd = cmd_cct(brightness, color_temp_raw);
+            rt.block_on(ble_write(peripheral, &cmd))
+        };
+        // Reset the clock on *either* outcome — this field really means
+        // "time until next heartbeat attempt", not "last successful write".
+        // On a persistent wedge, we want a warn every 20s, not ~2/sec.
+        *last_activity = Instant::now();
+        if let Err(e) = result {
+            warn!("[{}] BLE heartbeat failed: {}", name, e);
         }
     }
 }
@@ -406,7 +471,7 @@ async fn discover_ble_lights() -> Result<Vec<Light>, String> {
             name: name.clone(),
             is_gl1,
             is_pl81: false,
-            transport: Transport::Ble { peripheral },
+            transport: Transport::Ble { peripheral, last_activity: Instant::now() },
             state: LightState::new(),
         });
     }
