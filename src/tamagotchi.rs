@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use log::{error, info};
+use serde::Serialize;
 
 /// A pixel pet that lives on the LCD strip.
 /// It reacts to your work habits — happy when you ship PRs,
@@ -508,20 +509,58 @@ fn save_path() -> PathBuf {
         .join(".config/deckd/pet.json")
 }
 
+/// On-disk shape of a pet. Kept separate from `Pet` so the persisted format
+/// is insulated from the runtime struct, which carries non-serializable
+/// fields like `Instant` timestamps.
+#[derive(Serialize)]
+struct PetSnapshot<'a> {
+    name: &'a str,
+    species: &'static str,
+    energy: u8,
+    happiness: u8,
+    hunger: u8,
+    xp: u32,
+    level: u32,
+}
+
 impl Pet {
     pub fn save(&self) {
-        let species = match self.species {
-            Species::Cat => "cat",
-            Species::Dog => "dog",
-            Species::Penguin => "penguin",
-            Species::Ghost => "ghost",
+        let snapshot = PetSnapshot {
+            name: &self.name,
+            species: match self.species {
+                Species::Cat => "cat",
+                Species::Dog => "dog",
+                Species::Penguin => "penguin",
+                Species::Ghost => "ghost",
+            },
+            energy: self.energy,
+            happiness: self.happiness,
+            hunger: self.hunger,
+            xp: self.xp,
+            level: self.level,
         };
-        let json = format!(
-            r#"{{"name":"{}","species":"{}","energy":{},"happiness":{},"hunger":{},"xp":{},"level":{}}}"#,
-            self.name, species, self.energy, self.happiness, self.hunger, self.xp, self.level
-        );
-        if let Err(e) = std::fs::write(save_path(), json) {
-            error!("Failed to save pet: {}", e);
+        let json = match serde_json::to_string(&snapshot) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to serialize pet: {}", e);
+                return;
+            }
+        };
+
+        // Atomic save: write to a sibling temp file, then rename over the
+        // real file. POSIX rename() is atomic on the same filesystem, so a
+        // reader (or a racing writer) always sees either the old full file
+        // or the new full file — never a partially-overwritten mix. The
+        // previous `fs::write` call could leave trailing bytes from an
+        // earlier save if two writes interleaved or one got SIGKILLed.
+        let final_path = save_path();
+        let tmp_path = final_path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp_path, &json) {
+            error!("Failed to write pet tmp file: {}", e);
+            return;
+        }
+        if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
+            error!("Failed to rename pet tmp file: {}", e);
         }
     }
 
