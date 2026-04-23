@@ -169,6 +169,13 @@ fn main() {
 
 const LABEL: &str = "com.deckd.daemon";
 
+/// Safety net for the boot BLE scan. `discover_ble` already has its own 15s
+/// timeout inside the scan thread; this watchdog catches the case where the
+/// scan thread never delivers a result at all (channel dropped, thread dead,
+/// future permanently parked in btleplug). Set slightly longer than the
+/// inner timeout so, under normal failure, the inner path reports first.
+const BOOT_WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 fn plist_path() -> std::path::PathBuf {
     dirs::home_dir()
         .expect("home dir")
@@ -549,6 +556,18 @@ fn start_daemon() {
                 } else {
                     info!("BLE rescan complete: {} new light(s) ({} total)", new_count, all_lights.len());
                 }
+                last_lcd_refresh = Instant::now() - lcd_refresh_interval;
+            } else if is_booting && boot_start.elapsed() > BOOT_WATCHDOG_TIMEOUT {
+                // Watchdog: the scan thread should have either finished or hit its
+                // own 15s timeout by now. If neither has surfaced a result, release
+                // the boot state so the dashboard can take over. The scan thread
+                // and its channel are left intact — if a result arrives later, the
+                // try_recv branch above will still pick it up as a late "rescan".
+                warn!(
+                    "Boot BLE scan exceeded {:?}, releasing boot state",
+                    BOOT_WATCHDOG_TIMEOUT
+                );
+                is_booting = false;
                 last_lcd_refresh = Instant::now() - lcd_refresh_interval;
             } else if is_booting {
                 // Still scanning at boot — animate boot progress on LCD

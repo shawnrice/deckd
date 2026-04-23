@@ -556,14 +556,27 @@ pub fn discover_serial() -> Vec<Light> {
     lights
 }
 
-/// Discover BLE lights (takes ~5s for scanning)
+/// Hard ceiling on BLE discovery. The scan itself sleeps 5s, then each
+/// peripheral may require connect + service discovery — budget is ~10s of
+/// btleplug work even on a healthy adapter. We cap at 15s so a wedged
+/// CoreBluetooth future (common after sleep/wake) can't strand the boot
+/// state machine: on timeout we return an empty Vec, the spawned thread's
+/// `tx.send(..)` unblocks, `ble_pending` clears, and the LCD can leave the
+/// boot animation.
+const BLE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Discover BLE lights (takes ~5s for scanning, bounded by BLE_DISCOVERY_TIMEOUT)
 /// Must be called from a thread with its own tokio runtime.
 pub fn discover_ble(rt: &tokio::runtime::Runtime) -> Vec<Light> {
     let lights = rt.block_on(async {
-        match discover_ble_lights().await {
-            Ok(l) => l,
-            Err(e) => {
+        match tokio::time::timeout(BLE_DISCOVERY_TIMEOUT, discover_ble_lights()).await {
+            Ok(Ok(l)) => l,
+            Ok(Err(e)) => {
                 warn!("BLE discovery failed: {}", e);
+                Vec::new()
+            }
+            Err(_) => {
+                warn!("BLE discovery timed out after {:?}", BLE_DISCOVERY_TIMEOUT);
                 Vec::new()
             }
         }
