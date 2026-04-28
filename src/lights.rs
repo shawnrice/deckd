@@ -1,8 +1,10 @@
 use std::io::Write as IoWrite;
 use std::net::UdpSocket;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use log::{debug, info, warn};
+use log::{info, warn};
+use tokio::sync::{mpsc, Notify};
 
 // ── Protocol (shared across all transports) ─────────────────────
 
@@ -179,14 +181,7 @@ pub fn desklights_on(lights: &[Light]) -> bool {
 
 #[allow(dead_code)]
 enum Transport {
-    Ble {
-        peripheral: btleplug::platform::Peripheral,
-        /// Timestamp of the last successful write to this peripheral. Used
-        /// by `ble_heartbeat` to decide whether the connection needs a
-        /// keepalive poke. CoreBluetooth and the Neewer firmware both drop
-        /// idle BLE links after ~30s–5min of silence.
-        last_activity: Instant,
-    },
+    Ble(BleHandle),
     Serial {
         port: Box<dyn serialport::SerialPort>,
     },
@@ -198,9 +193,37 @@ enum Transport {
     },
 }
 
-/// How often we poke idle BLE peripherals with a no-op write to keep the
-/// connection alive. Shorter than the typical BLE idle-disconnect window.
+/// Outbound message to a per-peripheral BLE actor. The actor owns the
+/// `Peripheral` handle and serializes all GATT operations against it, so
+/// the deck loop never blocks on a wedged write.
+enum BleCmd {
+    Power(bool),
+    Cct { brightness: u8, temp_raw: u8 },
+    Gl1Cct { brightness: u8, temp_raw: u8 },
+}
+
+/// Handle to a BLE actor task. `try_send` is non-blocking; if the queue is
+/// full (actor is wedged or reconnecting), commands drop and a warn is logged.
+/// `reconnect` is an out-of-band signal: it never blocks and never drops, so
+/// the rescan button can always reach the actor — including (especially) when
+/// the command queue is saturated, which is exactly when recovery is needed.
+struct BleHandle {
+    name: String,
+    tx: mpsc::Sender<BleCmd>,
+    reconnect: Arc<Notify>,
+}
+
+const BLE_CMD_QUEUE_SIZE: usize = 16;
+/// Re-send the current brightness/temp on this cadence. Shorter than the
+/// typical BLE idle-disconnect window so the link doesn't go quiet long
+/// enough for the firmware or CoreBluetooth to drop it.
 const BLE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+/// Consecutive write failures before the actor tears the link down and
+/// reconnects. One stray timeout on a healthy link can happen; three in a
+/// row is a wedge.
+const BLE_STRIKE_THRESHOLD: u8 = 3;
+const BLE_RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
+const BLE_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 impl Light {
     /// Re-send GL1 handshake if it's been more than 10 seconds since the last one
@@ -215,19 +238,12 @@ impl Light {
         }
     }
 
-    pub fn set_power(&mut self, on: bool, rt: &tokio::runtime::Runtime) -> Result<(), String> {
+    pub fn set_power(&mut self, on: bool) -> Result<(), String> {
         self.ensure_gl1_alive();
         self.state.on = on;
 
         match &mut self.transport {
-            Transport::Ble { peripheral, last_activity } => {
-                let cmd = cmd_power(on); // 78 81 works for all BLE lights
-                let result = rt.block_on(ble_write(peripheral, &cmd));
-                if result.is_ok() {
-                    *last_activity = Instant::now();
-                }
-                result
-            }
+            Transport::Ble(h) => h.send(BleCmd::Power(on)),
             Transport::Serial { port } => {
                 // PL81: use brightness 0/100 since power command is unreliable
                 let cmd = if self.is_pl81 {
@@ -245,39 +261,46 @@ impl Light {
         }
     }
 
-    pub fn toggle_power(&mut self, rt: &tokio::runtime::Runtime) -> Result<(), String> {
+    pub fn toggle_power(&mut self) -> Result<(), String> {
         let on = !self.state.on;
-        self.set_power(on, rt)
+        self.set_power(on)
     }
 
-    pub fn adjust_brightness(&mut self, delta: i8, rt: &tokio::runtime::Runtime) -> Result<(), String> {
+    pub fn adjust_brightness(&mut self, delta: i8) -> Result<(), String> {
         self.state.adjust_brightness(delta);
-        self.send_cct(rt)
+        self.send_cct()
     }
 
-    pub fn adjust_temp(&mut self, delta: i16, rt: &tokio::runtime::Runtime) -> Result<(), String> {
+    pub fn adjust_temp(&mut self, delta: i16) -> Result<(), String> {
         self.state.adjust_temp(delta);
-        self.send_cct(rt)
+        self.send_cct()
     }
 
-    pub fn reset_temp(&mut self, rt: &tokio::runtime::Runtime) -> Result<(), String> {
+    pub fn reset_temp(&mut self) -> Result<(), String> {
         self.state.reset_temp();
-        self.send_cct(rt)
+        self.send_cct()
     }
 
-    pub fn set_preset(&mut self, brightness: u8, temp_k: u16, rt: &tokio::runtime::Runtime) -> Result<(), String> {
+    pub fn set_preset(&mut self, brightness: u8, temp_k: u16) -> Result<(), String> {
         self.state.brightness = brightness.clamp(0, 100);
         self.state.color_temp_k = temp_k.clamp(2900, 7000);
         self.state.color_temp_raw = ((temp_k.clamp(3200, 5600) - 3200) as f32 / 100.0) as u8 + 0x20;
         info!("[{}] preset: brightness={}, temp={}K", self.name, brightness, temp_k);
-        // Turn on if off
         if !self.state.on {
-            self.set_power(true, rt)?;
+            self.set_power(true)?;
         }
-        self.send_cct(rt)
+        self.send_cct()
     }
 
-    fn send_cct(&mut self, rt: &tokio::runtime::Runtime) -> Result<(), String> {
+    /// Manual recovery kick — drop the current BLE link and reconnect
+    /// immediately. No-op for non-BLE transports.
+    pub fn force_reconnect(&mut self) {
+        if let Transport::Ble(h) = &self.transport {
+            h.reconnect.notify_one();
+        }
+    }
+
+    fn send_cct(&mut self) -> Result<(), String> {
         self.ensure_gl1_alive();
         info!(
             "[{}] brightness={}, temp={}K",
@@ -285,7 +308,6 @@ impl Light {
         );
 
         if self.is_pl81 {
-            // PL81 PRO: 0x3A serial protocol with 16-bit checksum
             let temp_byte = kelvin_to_pl81_temp(self.state.color_temp_k);
             let cmd = pl81_cmd_cct(self.state.brightness, temp_byte);
             match &mut self.transport {
@@ -293,18 +315,11 @@ impl Light {
                 _ => Ok(()),
             }
         } else if self.is_gl1 {
-            // GL1 PRO: separate brightness + temperature commands (0x82, 0x83)
-            let brt_cmd = cmd_long_cct_brightness(self.state.brightness);
-            let temp_cmd = cmd_long_cct_temp(self.state.color_temp_raw);
             match &mut self.transport {
-                Transport::Ble { peripheral, last_activity } => {
-                    rt.block_on(ble_write(peripheral, &brt_cmd))?;
-                    let result = rt.block_on(ble_write(peripheral, &temp_cmd));
-                    if result.is_ok() {
-                        *last_activity = Instant::now();
-                    }
-                    result
-                }
+                Transport::Ble(h) => h.send(BleCmd::Gl1Cct {
+                    brightness: self.state.brightness,
+                    temp_raw: self.state.color_temp_raw,
+                }),
                 Transport::Udp { socket, broadcast_addr, .. } => {
                     let cmd = gl1_cmd_cct(self.state.brightness, self.state.color_temp_k);
                     udp_write(socket, broadcast_addr, &cmd)
@@ -312,83 +327,71 @@ impl Light {
                 _ => Ok(()),
             }
         } else {
-            // Standard Neewer BLE CCT
-            let cmd = cmd_cct(self.state.brightness, self.state.color_temp_raw);
             match &mut self.transport {
-                Transport::Ble { peripheral, last_activity } => {
-                    let result = rt.block_on(ble_write(peripheral, &cmd));
-                    if result.is_ok() {
-                        *last_activity = Instant::now();
-                    }
-                    result
+                Transport::Ble(h) => h.send(BleCmd::Cct {
+                    brightness: self.state.brightness,
+                    temp_raw: self.state.color_temp_raw,
+                }),
+                Transport::Serial { port } => {
+                    let cmd = cmd_cct(self.state.brightness, self.state.color_temp_raw);
+                    serial_write(port, &cmd)
                 }
-                Transport::Serial { port } => serial_write(port, &cmd),
-                Transport::Udp { socket, broadcast_addr, .. } => udp_write(socket, broadcast_addr, &cmd),
+                Transport::Udp { socket, broadcast_addr, .. } => {
+                    let cmd = cmd_cct(self.state.brightness, self.state.color_temp_raw);
+                    udp_write(socket, broadcast_addr, &cmd)
+                }
             }
         }
     }
+}
 
-    /// Keepalive for BLE peripherals. If it's been more than
-    /// `BLE_HEARTBEAT_INTERVAL` since the last successful write, re-send the
-    /// current brightness/temp — the same bytes the light already has, so
-    /// there's no visible effect, just enough BLE traffic to reset the idle
-    /// disconnect timer on both sides. No-op for non-BLE transports.
-    pub fn ble_heartbeat(&mut self, rt: &tokio::runtime::Runtime) {
-        // Snapshot the fields we need before we take a mutable borrow on
-        // `self.transport` below — otherwise the borrow checker can't see
-        // that we're reading disjoint fields.
-        let name = &self.name;
-        let is_gl1 = self.is_gl1;
-        let brightness = self.state.brightness;
-        let color_temp_raw = self.state.color_temp_raw;
+impl BleHandle {
+    fn send(&self, cmd: BleCmd) -> Result<(), String> {
+        // try_send so the deck loop never blocks. If the actor's queue is
+        // full it means writes are stuck; dropping a command is preferable
+        // to freezing the UI — the next user action or the actor's own
+        // strike-counter teardown will catch up.
+        self.tx.try_send(cmd).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => {
+                format!("[{}] BLE queue full, dropping command", self.name)
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                format!("[{}] BLE actor exited", self.name)
+            }
+        })
+    }
+}
 
-        let Transport::Ble { peripheral, last_activity } = &mut self.transport else {
-            return;
-        };
-        if last_activity.elapsed() < BLE_HEARTBEAT_INTERVAL {
-            return;
-        }
-
-        debug!("[{}] BLE heartbeat", name);
-        let result: Result<(), String> = if is_gl1 {
-            let brt_cmd = cmd_long_cct_brightness(brightness);
-            let temp_cmd = cmd_long_cct_temp(color_temp_raw);
-            rt.block_on(async {
-                ble_write(peripheral, &brt_cmd).await?;
-                ble_write(peripheral, &temp_cmd).await
-            })
-        } else {
-            let cmd = cmd_cct(brightness, color_temp_raw);
-            rt.block_on(ble_write(peripheral, &cmd))
-        };
-        // Reset the clock on *either* outcome — this field really means
-        // "time until next heartbeat attempt", not "last successful write".
-        // On a persistent wedge, we want a warn every 20s, not ~2/sec.
-        *last_activity = Instant::now();
-        if let Err(e) = result {
-            warn!("[{}] BLE heartbeat failed: {}", name, e);
+/// Force-reconnect every BLE light. Used by the rescan button and by
+/// macOS wake-from-sleep recovery.
+pub fn force_reconnect_all(lights: &mut [Light]) {
+    let mut count = 0usize;
+    for l in lights.iter_mut() {
+        if matches!(l.transport, Transport::Ble(_)) {
+            l.force_reconnect();
+            count += 1;
         }
     }
+    info!("Rescan: kicking {} BLE light(s)", count);
 }
 
 // ── BLE transport ───────────────────────────────────────────────
 
 use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter, WriteType};
-use btleplug::platform::Manager;
+use btleplug::platform::{Manager, Peripheral};
 use uuid::Uuid;
 
 const NEEWER_SERVICE: Uuid = Uuid::from_u128(0x69400001_b5a3_f393_e0a9_e50e24dcca99);
 const NEEWER_WRITE_CHAR: Uuid = Uuid::from_u128(0x69400002_b5a3_f393_e0a9_e50e24dcca99);
 
-/// Timeout for individual BLE writes. CoreBluetooth can wedge for seconds or
-/// forever after sleep/wake cycles; without a bound, a single write can freeze
-/// the main event loop (see `rt.block_on(ble_write(..))` callers).
+/// Timeout for individual BLE writes. CoreBluetooth has no link-supervision
+/// signal exposed at this layer — when the radio link dies, `WriteWithoutResponse`
+/// hangs indefinitely waiting on a `peripheralIsReady` flow-control event that
+/// never fires. The bound here is what turns "hung forever" into "fast enough
+/// for the strike counter to notice and force a reconnect".
 const BLE_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 
-async fn ble_write(
-    peripheral: &btleplug::platform::Peripheral,
-    cmd: &[u8],
-) -> Result<(), String> {
+async fn ble_write(peripheral: &Peripheral, cmd: &[u8]) -> Result<(), String> {
     let chars = peripheral.characteristics();
     let write_char = chars
         .iter()
@@ -403,7 +406,158 @@ async fn ble_write(
     }
 }
 
-async fn discover_ble_lights() -> Result<Vec<Light>, String> {
+/// Per-peripheral BLE actor. Owns the `Peripheral` handle and serializes
+/// every GATT operation against it. Tracks consecutive-failure strikes so a
+/// wedged link drives an automatic teardown + reconnect rather than logging
+/// warnings forever.
+async fn ble_actor(
+    name: String,
+    peripheral: Peripheral,
+    is_gl1: bool,
+    mut rx: mpsc::Receiver<BleCmd>,
+    reconnect_signal: Arc<Notify>,
+) {
+    // Last known desired state, replayed after every reconnect so the light
+    // ends up matching what the user has been tapping during the outage.
+    let mut last_brightness: u8 = 50;
+    let mut last_temp_raw: u8 = 0x2C;
+    let mut last_power: bool = true;
+
+    let mut connected = true;
+    let mut strikes: u8 = 0;
+    let mut backoff = BLE_RECONNECT_BACKOFF_INITIAL;
+
+    let mut hb = tokio::time::interval(BLE_HEARTBEAT_INTERVAL);
+    hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        if !connected {
+            // Disconnected: wait `backoff`, but stay responsive to a manual
+            // reconnect kick so the rescan button collapses the wait.
+            let mut force_now = false;
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = reconnect_signal.notified() => {
+                    force_now = true;
+                }
+                msg = rx.recv() => {
+                    if msg.is_none() {
+                        return;
+                    }
+                    // Drop writes while disconnected — main thread's state
+                    // mirror is the source of truth and will be replayed on
+                    // reconnect.
+                }
+            }
+            if force_now {
+                backoff = Duration::from_millis(0);
+            }
+
+            match reconnect(&peripheral).await {
+                Ok(()) => {
+                    info!("[{}] BLE reconnected", name);
+                    connected = true;
+                    strikes = 0;
+                    backoff = BLE_RECONNECT_BACKOFF_INITIAL;
+                    // Replay last known state so the light catches up.
+                    let _ = ble_write(&peripheral, &cmd_power(last_power)).await;
+                    let _ = write_cct(&peripheral, is_gl1, last_brightness, last_temp_raw).await;
+                }
+                Err(e) => {
+                    warn!("[{}] BLE reconnect failed: {} (backoff {:?})", name, e, backoff);
+                    backoff = (backoff * 2).min(BLE_RECONNECT_BACKOFF_MAX);
+                }
+            }
+            continue;
+        }
+
+        tokio::select! {
+            _ = reconnect_signal.notified() => {
+                info!("[{}] BLE force reconnect", name);
+                let _ = peripheral.disconnect().await;
+                connected = false;
+                backoff = Duration::from_millis(0);
+                continue;
+            }
+            msg = rx.recv() => {
+                let Some(cmd) = msg else { return; };
+                let result = match cmd {
+                    BleCmd::Power(on) => {
+                        last_power = on;
+                        ble_write(&peripheral, &cmd_power(on)).await
+                    }
+                    BleCmd::Cct { brightness, temp_raw } => {
+                        last_brightness = brightness;
+                        last_temp_raw = temp_raw;
+                        ble_write(&peripheral, &cmd_cct(brightness, temp_raw)).await
+                    }
+                    BleCmd::Gl1Cct { brightness, temp_raw } => {
+                        last_brightness = brightness;
+                        last_temp_raw = temp_raw;
+                        write_gl1_cct(&peripheral, brightness, temp_raw).await
+                    }
+                };
+                handle_write_result(&name, &peripheral, result, &mut connected, &mut strikes, &mut backoff).await;
+            }
+            _ = hb.tick() => {
+                let result = write_cct(&peripheral, is_gl1, last_brightness, last_temp_raw).await;
+                handle_write_result(&name, &peripheral, result, &mut connected, &mut strikes, &mut backoff).await;
+            }
+        }
+    }
+}
+
+async fn write_cct(peripheral: &Peripheral, is_gl1: bool, brightness: u8, temp_raw: u8) -> Result<(), String> {
+    if is_gl1 {
+        write_gl1_cct(peripheral, brightness, temp_raw).await
+    } else {
+        ble_write(peripheral, &cmd_cct(brightness, temp_raw)).await
+    }
+}
+
+async fn write_gl1_cct(peripheral: &Peripheral, brightness: u8, temp_raw: u8) -> Result<(), String> {
+    ble_write(peripheral, &cmd_long_cct_brightness(brightness)).await?;
+    ble_write(peripheral, &cmd_long_cct_temp(temp_raw)).await
+}
+
+/// On success: reset strikes. On failure: increment, and after
+/// `BLE_STRIKE_THRESHOLD` consecutive misses, tear down the link so the
+/// actor's reconnect path can rescue it. Don't trust `is_connected()`.
+async fn handle_write_result(
+    name: &str,
+    peripheral: &Peripheral,
+    result: Result<(), String>,
+    connected: &mut bool,
+    strikes: &mut u8,
+    backoff: &mut Duration,
+) {
+    match result {
+        Ok(()) => *strikes = 0,
+        Err(e) => {
+            *strikes += 1;
+            warn!("[{}] BLE write failed (strike {}/{}): {}", name, strikes, BLE_STRIKE_THRESHOLD, e);
+            if *strikes >= BLE_STRIKE_THRESHOLD {
+                warn!("[{}] strike threshold hit — tearing down link", name);
+                let _ = peripheral.disconnect().await;
+                *connected = false;
+                *strikes = 0;
+                *backoff = BLE_RECONNECT_BACKOFF_INITIAL;
+            }
+        }
+    }
+}
+
+async fn reconnect(peripheral: &Peripheral) -> Result<(), String> {
+    // disconnect() is a local op against the OS; it's safe to call even on
+    // a wedged handle and clears any half-dead CoreBluetooth state before
+    // we ask for a fresh connection.
+    let _ = peripheral.disconnect().await;
+    peripheral.connect().await.map_err(|e| format!("connect: {}", e))?;
+    peripheral.discover_services().await.map_err(|e| format!("discover_services: {}", e))?;
+    Ok(())
+}
+
+async fn discover_ble_lights(rt: tokio::runtime::Handle) -> Result<Vec<Light>, String> {
     let manager = Manager::new()
         .await
         .map_err(|e| format!("BLE manager: {}", e))?;
@@ -467,11 +621,22 @@ async fn discover_ble_lights() -> Result<Vec<Light>, String> {
 
         let is_gl1 = name_upper.contains("GL1");
         info!("BLE: connected to {}{}", name, if is_gl1 { " (GL1 format)" } else { "" });
+
+        let (tx, actor_rx) = mpsc::channel(BLE_CMD_QUEUE_SIZE);
+        let reconnect_signal = Arc::new(Notify::new());
+        rt.spawn(ble_actor(
+            name.clone(),
+            peripheral,
+            is_gl1,
+            actor_rx,
+            Arc::clone(&reconnect_signal),
+        ));
+
         lights.push(Light {
             name: name.clone(),
             is_gl1,
             is_pl81: false,
-            transport: Transport::Ble { peripheral, last_activity: Instant::now() },
+            transport: Transport::Ble(BleHandle { name, tx, reconnect: reconnect_signal }),
             state: LightState::new(),
         });
     }
@@ -630,11 +795,13 @@ pub fn discover_serial() -> Vec<Light> {
 /// boot animation.
 const BLE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Discover BLE lights (takes ~5s for scanning, bounded by BLE_DISCOVERY_TIMEOUT)
-/// Must be called from a thread with its own tokio runtime.
+/// Discover BLE lights and spawn one actor task per light on `rt`. Each
+/// actor owns its `Peripheral` and serializes writes; the returned `Light`s
+/// hold only the actor's command channel. Bounded by BLE_DISCOVERY_TIMEOUT.
 pub fn discover_ble(rt: &tokio::runtime::Runtime) -> Vec<Light> {
-    let lights = rt.block_on(async {
-        match tokio::time::timeout(BLE_DISCOVERY_TIMEOUT, discover_ble_lights()).await {
+    let handle = rt.handle().clone();
+    let lights = rt.block_on(async move {
+        match tokio::time::timeout(BLE_DISCOVERY_TIMEOUT, discover_ble_lights(handle)).await {
             Ok(Ok(l)) => l,
             Ok(Err(e)) => {
                 warn!("BLE discovery failed: {}", e);

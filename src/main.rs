@@ -423,28 +423,35 @@ fn start_daemon() {
         Vec::new()
     };
 
-    // BLE scan runs in background — lights will be added when ready
-    let ble_rx = if lights_enabled && !is_restart {
+    // Long-lived multi-thread runtime: hosts every per-peripheral BLE actor
+    // task plus any discovery futures. Shared via Arc with discovery threads
+    // so actors spawned during a rescan run on the same runtime as the rest.
+    let rt = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime"),
+    );
+
+    // BLE scan runs in background — lights will be added when ready.
+    // Always scan when lights are enabled, even on a quick restart: skipping
+    // discovery here means a launchd respawn (USB hub blip, deck disconnect,
+    // manual `kill`) leaves the daemon with zero BLE lights and no way to
+    // recover. The 15s inner timeout + 20s watchdog already protect against
+    // a wedged scan.
+    let ble_rx = if lights_enabled {
         boot::render_boot_frame(&mut deck, 0.5, "scanning BLE...");
         let (tx, rx) = std::sync::mpsc::channel();
+        let rt_scan = Arc::clone(&rt);
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime");
-            let ble_lights = lights::discover_ble(&rt);
+            let ble_lights = lights::discover_ble(&rt_scan);
             tx.send(ble_lights).ok();
         });
         Some(rx)
     } else {
         None
     };
-
-    // Initialize tokio runtime for BLE operations (for ongoing commands)
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("Failed to create tokio runtime");
 
     // Start dashboard background poller
     let dash_state = dashboard::new_shared();
@@ -512,6 +519,9 @@ fn start_daemon() {
         if let Ok(elapsed) = std::time::SystemTime::now().duration_since(last_wake_check) {
             if elapsed > std::time::Duration::from_secs(10) {
                 info!("Detected wake from sleep (gap: {:?}), refreshing deck state", elapsed);
+                // BLE links don't survive macOS sleep — force every actor
+                // to tear down and reconnect.
+                lights::force_reconnect_all(&mut all_lights);
                 // Re-render current page buttons — the Stream Deck firmware
                 // blanks button images during macOS sleep.
                 render_page(&mut deck, &cfg, &page_stack);
@@ -583,13 +593,7 @@ fn start_daemon() {
             }
         }
 
-        // BLE keepalive — each Light::ble_heartbeat is a no-op unless the
-        // peripheral has been idle past BLE_HEARTBEAT_INTERVAL, so the hot
-        // path is just a timestamp comparison. Bounded by the 500ms ble_write
-        // timeout, so a wedged peripheral can't stall the main loop.
-        for light in all_lights.iter_mut() {
-            light.ble_heartbeat(&rt);
-        }
+        // BLE keepalive is owned by each light's actor task — no main-loop work needed.
 
         let poll_result = deck::poll_and_dispatch(&deck, &cfg, &page_stack, &mut read_errors, &mut touch_state);
         if poll_result.is_err() {
@@ -625,7 +629,7 @@ fn start_daemon() {
                         warn!("Light command '{}' but no lights connected", cmd);
                         continue;
                     }
-                    handle_light_command(&mut all_lights, &cmd, &rt);
+                    handle_light_command(&mut all_lights, &cmd);
                     let cp = current_page(&page_stack);
                     if cp == "keylights" {
                         render::render_light_toggle_button(&mut deck, lights::keylights_on(&all_lights));
@@ -634,21 +638,10 @@ fn start_daemon() {
                     }
                 }
                 deck::InputResult::BleScan => {
-                    if ble_pending.is_some() {
-                        info!("BLE scan already in progress, ignoring");
-                    } else {
-                        info!("Starting BLE rescan...");
-                        let (tx, rx) = std::sync::mpsc::channel();
-                        std::thread::spawn(move || {
-                            let rt = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .expect("tokio runtime");
-                            let ble_lights = lights::discover_ble(&rt);
-                            tx.send(ble_lights).ok();
-                        });
-                        ble_pending = Some(rx);
-                    }
+                    // The button is a recovery kick, not a discovery action.
+                    // Each BLE actor force-reconnects its peripheral; the
+                    // light set is fixed and configured at boot.
+                    lights::force_reconnect_all(&mut all_lights);
                 }
                 deck::InputResult::CameraCommand(cmd) => {
                     handle_camera_command(&mut cam_state, &cmd);
@@ -817,8 +810,8 @@ fn start_daemon() {
                 if in_meeting && cp == cfg.start_page() {
                     // Auto-enter meeting mode — replaces stack
                     info!("Auto-entering meeting mode");
-                    handle_light_command(&mut all_lights, "preset:70:5000:keylights", &rt);
-                    handle_light_command(&mut all_lights, "preset:30:5000:desklights", &rt);
+                    handle_light_command(&mut all_lights, "preset:70:5000:keylights");
+                    handle_light_command(&mut all_lights, "preset:30:5000:desklights");
                     page_stack = vec![cfg.start_page(), "meeting".into()];
                     render_page(&mut deck, &cfg, &page_stack);
                     let muted = dash_state.lock().map(|s| s.mic_muted).unwrap_or(false);
@@ -827,8 +820,8 @@ fn start_daemon() {
                 } else if !in_meeting && cp == "meeting" {
                     // Auto-exit meeting mode — back to base
                     info!("Auto-exiting meeting mode");
-                    handle_light_command(&mut all_lights, "preset:50:4400:keylights", &rt);
-                    handle_light_command(&mut all_lights, "preset:50:4400:desklights", &rt);
+                    handle_light_command(&mut all_lights, "preset:50:4400:keylights");
+                    handle_light_command(&mut all_lights, "preset:50:4400:desklights");
                     page_stack = vec![cfg.start_page()];
                     render_page(&mut deck, &cfg, &page_stack);
                     last_lcd_refresh = Instant::now() - lcd_refresh_interval;
@@ -970,7 +963,6 @@ fn render_page(deck: &mut elgato_streamdeck::StreamDeck, cfg: &config::Config, s
 fn handle_light_command(
     all_lights: &mut [lights::Light],
     cmd_str: &str,
-    rt: &tokio::runtime::Runtime,
 ) {
     // Parse preset commands: "preset:brightness:temp_k[:group]"
     // Parse regular commands: "command[:group]"
@@ -1002,15 +994,15 @@ fn handle_light_command(
         }
 
         let result = match cmd {
-            "on" => light.set_power(true, rt),
-            "off" => light.set_power(false, rt),
-            "toggle" => light.toggle_power(rt),
-            "brightness_up" => light.adjust_brightness(5, rt),
-            "brightness_down" => light.adjust_brightness(-5, rt),
-            "temp_warmer" => light.adjust_temp(-100, rt),
-            "temp_cooler" => light.adjust_temp(100, rt),
-            "temp_reset" => light.reset_temp(rt),
-            "preset" => light.set_preset(preset_brt, preset_temp, rt),
+            "on" => light.set_power(true),
+            "off" => light.set_power(false),
+            "toggle" => light.toggle_power(),
+            "brightness_up" => light.adjust_brightness(5),
+            "brightness_down" => light.adjust_brightness(-5),
+            "temp_warmer" => light.adjust_temp(-100),
+            "temp_cooler" => light.adjust_temp(100),
+            "temp_reset" => light.reset_temp(),
+            "preset" => light.set_preset(preset_brt, preset_temp),
             other => {
                 warn!("Unknown light command: {}", other);
                 Ok(())
