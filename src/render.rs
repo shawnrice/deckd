@@ -1232,6 +1232,21 @@ pub fn render_light_toggle_button(deck: &mut StreamDeck, on: bool) {
     deck.flush().ok();
 }
 
+/// Render the rescan button at the given key index. When `scanning` is true,
+/// shows an active "Scanning..." style so the user gets immediate feedback
+/// that the (multi-second) BLE rediscovery has started.
+pub fn render_rescan_button(deck: &mut StreamDeck, key: u8, scanning: bool) {
+    let key_size = 120_u32;
+    let (label, bg, fg) = if scanning {
+        ("Scanning...", parse_hex("#1a3a3a"), parse_hex("#ffe066"))
+    } else {
+        ("Rescan", parse_hex("#1a1a2e"), parse_hex("#70b8ff"))
+    };
+    let img = render_button(label, Some("refresh"), key_size, bg, fg);
+    deck.set_button_image(key, img).ok();
+    deck.flush().ok();
+}
+
 /// Render a stateful mic mute button on button 0.
 /// Shows "Mic: On" (green) when unmuted, "Mic: Muted" (red) when muted.
 pub fn render_mic_button(deck: &mut StreamDeck, muted: bool) {

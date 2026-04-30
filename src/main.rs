@@ -440,12 +440,14 @@ fn start_daemon() {
     // manual `kill`) leaves the daemon with zero BLE lights and no way to
     // recover. The 15s inner timeout + 20s watchdog already protect against
     // a wedged scan.
+    let expected_ble = cfg.expected_ble_lights;
     let ble_rx = if lights_enabled {
         boot::render_boot_frame(&mut deck, 0.5, "scanning BLE...");
         let (tx, rx) = std::sync::mpsc::channel();
         let rt_scan = Arc::clone(&rt);
         std::thread::spawn(move || {
-            let ble_lights = lights::discover_ble(&rt_scan);
+            let ble_lights =
+                lights::discover_ble(&rt_scan, std::collections::HashSet::new(), expected_ble);
             tx.send(ble_lights).ok();
         });
         Some(rx)
@@ -511,6 +513,9 @@ fn start_daemon() {
     let mut touch_state = deck::TouchState::new();
     let mut ble_pending = ble_rx;
     let mut is_booting = ble_pending.is_some();
+    // Set when the rescan button kicks off a BLE scan; cleared when results
+    // arrive so we know which key (if any) to repaint with the default image.
+    let mut rescan_button_key: Option<u8> = None;
     // Sleep/wake detection: compare wall-clock delta across iterations.
     // If wall clock jumps forward much more than the loop period, we slept.
     let mut last_wake_check = std::time::SystemTime::now();
@@ -565,6 +570,14 @@ fn start_daemon() {
                     is_booting = false;
                 } else {
                     info!("BLE rescan complete: {} new light(s) ({} total)", new_count, all_lights.len());
+                }
+                // Clear rescan-in-progress styling. Re-render the page if the
+                // user is still on a page that owns the rescan button — that
+                // also restores any other state that might have been stale.
+                if let Some(key) = rescan_button_key.take() {
+                    if find_rescan_key(&cfg, &page_stack) == Some(key) {
+                        render::render_rescan_button(&mut deck, key, false);
+                    }
                 }
                 last_lcd_refresh = Instant::now() - lcd_refresh_interval;
             } else if is_booting && boot_start.elapsed() > BOOT_WATCHDOG_TIMEOUT {
@@ -638,10 +651,49 @@ fn start_daemon() {
                     }
                 }
                 deck::InputResult::BleScan => {
-                    // The button is a recovery kick, not a discovery action.
-                    // Each BLE actor force-reconnects its peripheral; the
-                    // light set is fixed and configured at boot.
+                    // Three jobs, in order:
+                    //   1. Kick already-tracked BLE lights so a wedged
+                    //      CoreBluetooth link gets torn down + retried.
+                    //   2. Re-run USB serial enumeration in case a PL81
+                    //      came back after the daemon's boot scan ran on
+                    //      a not-yet-warm USB stack (post-reattach race).
+                    //   3. Spawn a fresh BLE scan to discover lights that
+                    //      missed the boot window, with `existing_names`
+                    //      so we don't double-spawn an actor.
                     lights::force_reconnect_all(&mut all_lights);
+
+                    let existing: std::collections::HashSet<String> = all_lights
+                        .iter()
+                        .map(|l| l.name.clone())
+                        .collect();
+                    let new_serial = lights::discover_serial_excluding(&existing);
+                    if !new_serial.is_empty() {
+                        all_lights.extend(new_serial);
+                    }
+
+                    if ble_pending.is_none() {
+                        let rescan_key = find_rescan_key(&cfg, &page_stack);
+                        if let Some(key) = rescan_key {
+                            render::render_rescan_button(&mut deck, key, true);
+                        }
+                        rescan_button_key = rescan_key;
+
+                        // BLE peripheral names ("NEEWER-GL1 PRO") are disjoint
+                        // from USB serial labels ("Neewer USB (/dev/cu.xxx)"),
+                        // so passing the full set as the dedup filter is safe.
+                        let names_for_scan: std::collections::HashSet<String> =
+                            all_lights.iter().map(|l| l.name.clone()).collect();
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let rt_scan = Arc::clone(&rt);
+                        let expected = cfg.expected_ble_lights;
+                        std::thread::spawn(move || {
+                            let lights = lights::discover_ble(&rt_scan, names_for_scan, expected);
+                            tx.send(lights).ok();
+                        });
+                        ble_pending = Some(rx);
+                    } else {
+                        info!("Rescan: BLE scan already in progress, skipping");
+                    }
                 }
                 deck::InputResult::CameraCommand(cmd) => {
                     handle_camera_command(&mut cam_state, &cmd);
@@ -952,6 +1004,32 @@ fn push_page(stack: &mut Vec<String>, page: String) {
 
 fn current_page(stack: &[String]) -> &str {
     stack.last().map(|s| s.as_str()).unwrap_or("main")
+}
+
+/// Find the button index (0-7) whose `on_press` action triggers a BLE rescan
+/// on the current page stack. Returns `None` if no rescan button is bound.
+/// Used to paint a "Scanning..." state on the right key when a rescan starts
+/// without hardcoding a position.
+fn find_rescan_key(cfg: &config::Config, stack: &[String]) -> Option<u8> {
+    let buttons = cfg.resolved_buttons(stack);
+    for (key, btn) in &buttons {
+        if action_triggers_ble_scan(btn.on_press.as_ref()) {
+            if let Ok(idx) = key.parse::<u8>() {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn action_triggers_ble_scan(action: Option<&config::Action>) -> bool {
+    match action {
+        Some(config::Action::BleScan) => true,
+        Some(config::Action::Multi { actions }) => actions
+            .iter()
+            .any(|a| action_triggers_ble_scan(Some(a))),
+        _ => false,
+    }
 }
 
 fn render_page(deck: &mut elgato_streamdeck::StreamDeck, cfg: &config::Config, stack: &[String]) {

@@ -18,6 +18,12 @@ pub struct Config {
     /// Camera vendor:product ID (e.g. "046d:0944"). Auto-detects if not set.
     pub camera: Option<String>,
 
+    /// Number of BLE lights expected to be present. When set, boot and rescan
+    /// will retry the BLE scan with longer windows until at least this many
+    /// are connected (or attempts are exhausted). Leave unset to fall back to
+    /// a single 5s scan.
+    pub expected_ble_lights: Option<usize>,
+
     #[serde(default)]
     pub monitoring: MonitoringConfig,
 

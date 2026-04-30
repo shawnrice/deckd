@@ -224,6 +224,13 @@ const BLE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 const BLE_STRIKE_THRESHOLD: u8 = 3;
 const BLE_RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BLE_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Timeout for the reconnect handshake (disconnect + connect + discover).
+/// CoreBluetooth's per-peripheral event receiver can die under wake-from-sleep
+/// or after a forced disconnect, leaving the next `connect().await` parked
+/// forever waiting for an event that will never arrive. Without this bound,
+/// the rescan button silently wedges the actor — same hang shape as the
+/// write path before BLE_WRITE_TIMEOUT was added.
+const BLE_RECONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 impl Light {
     /// Re-send GL1 handshake if it's been more than 10 seconds since the last one
@@ -474,7 +481,10 @@ async fn ble_actor(
         tokio::select! {
             _ = reconnect_signal.notified() => {
                 info!("[{}] BLE force reconnect", name);
-                let _ = peripheral.disconnect().await;
+                // Bounded: disconnect can hang on a half-dead CoreBluetooth
+                // handle. The reconnect path that runs next will retry
+                // disconnect anyway with its own timeout.
+                let _ = tokio::time::timeout(BLE_RECONNECT_TIMEOUT, peripheral.disconnect()).await;
                 connected = false;
                 backoff = Duration::from_millis(0);
                 continue;
@@ -538,7 +548,7 @@ async fn handle_write_result(
             warn!("[{}] BLE write failed (strike {}/{}): {}", name, strikes, BLE_STRIKE_THRESHOLD, e);
             if *strikes >= BLE_STRIKE_THRESHOLD {
                 warn!("[{}] strike threshold hit — tearing down link", name);
-                let _ = peripheral.disconnect().await;
+                let _ = tokio::time::timeout(BLE_RECONNECT_TIMEOUT, peripheral.disconnect()).await;
                 *connected = false;
                 *strikes = 0;
                 *backoff = BLE_RECONNECT_BACKOFF_INITIAL;
@@ -551,13 +561,23 @@ async fn reconnect(peripheral: &Peripheral) -> Result<(), String> {
     // disconnect() is a local op against the OS; it's safe to call even on
     // a wedged handle and clears any half-dead CoreBluetooth state before
     // we ask for a fresh connection.
-    let _ = peripheral.disconnect().await;
-    peripheral.connect().await.map_err(|e| format!("connect: {}", e))?;
-    peripheral.discover_services().await.map_err(|e| format!("discover_services: {}", e))?;
-    Ok(())
+    let fut = async {
+        let _ = peripheral.disconnect().await;
+        peripheral.connect().await.map_err(|e| format!("connect: {}", e))?;
+        peripheral.discover_services().await.map_err(|e| format!("discover_services: {}", e))?;
+        Ok::<(), String>(())
+    };
+    match tokio::time::timeout(BLE_RECONNECT_TIMEOUT, fut).await {
+        Ok(r) => r,
+        Err(_) => Err(format!("reconnect timed out after {:?}", BLE_RECONNECT_TIMEOUT)),
+    }
 }
 
-async fn discover_ble_lights(rt: tokio::runtime::Handle) -> Result<Vec<Light>, String> {
+async fn discover_ble_lights(
+    rt: tokio::runtime::Handle,
+    existing_names: std::collections::HashSet<String>,
+    scan_secs: u64,
+) -> Result<Vec<Light>, String> {
     let manager = Manager::new()
         .await
         .map_err(|e| format!("BLE manager: {}", e))?;
@@ -567,12 +587,12 @@ async fn discover_ble_lights(rt: tokio::runtime::Handle) -> Result<Vec<Light>, S
         .map_err(|e| format!("BLE adapters: {}", e))?;
     let adapter = adapters.into_iter().next().ok_or("No BLE adapter")?;
 
-    info!("BLE: scanning (5s)...");
+    info!("BLE: scanning ({}s)...", scan_secs);
     adapter
         .start_scan(ScanFilter::default())
         .await
         .map_err(|e| format!("BLE scan: {}", e))?;
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(scan_secs)).await;
     adapter.stop_scan().await.ok();
 
     let peripherals = adapter
@@ -587,15 +607,27 @@ async fn discover_ble_lights(rt: tokio::runtime::Handle) -> Result<Vec<Light>, S
             None => continue,
         };
 
-        let name = props.local_name.unwrap_or_default();
-        let name_upper = name.to_uppercase();
+        let advertised = props.local_name.unwrap_or_default();
+        let advertised_upper = advertised.to_uppercase();
 
-        let is_neewer = name_upper.starts_with("NEEWER")
-            || name_upper.starts_with("NW-")
-            || name_upper.starts_with("NW ")
+        let is_neewer = advertised_upper.starts_with("NEEWER")
+            || advertised_upper.starts_with("NW-")
+            || advertised_upper.starts_with("NW ")
             || props.services.contains(&NEEWER_SERVICE);
 
         if !is_neewer {
+            continue;
+        }
+
+        // Two NEEWER GL1 PROs advertise the *same* local_name, so the unique
+        // identity is the peripheral address. Light.name embeds it for dedup
+        // and log clarity while keeping the friendly name first.
+        let addr = peripheral.address().to_string();
+        let name = format!("{} [{}]", advertised, addr);
+
+        // Skip peripherals an existing actor already owns. Re-connecting here
+        // would spawn a duplicate actor for the same physical light.
+        if existing_names.contains(&name) {
             continue;
         }
 
@@ -619,7 +651,7 @@ async fn discover_ble_lights(rt: tokio::runtime::Handle) -> Result<Vec<Light>, S
             continue;
         }
 
-        let is_gl1 = name_upper.contains("GL1");
+        let is_gl1 = advertised_upper.contains("GL1");
         info!("BLE: connected to {}{}", name, if is_gl1 { " (GL1 format)" } else { "" });
 
         let (tx, actor_rx) = mpsc::channel(BLE_CMD_QUEUE_SIZE);
@@ -779,44 +811,118 @@ fn discover_gl1_lights() -> Vec<Light> {
 
 /// Discover USB serial lights (instant, no scanning delay)
 pub fn discover_serial() -> Vec<Light> {
+    info!("Serial: scanning USB...");
     let lights = discover_serial_lights();
+    info!("Serial: found {} USB light(s)", lights.len());
     for light in &lights {
         info!("  - {}", light.name);
     }
     lights
 }
 
-/// Hard ceiling on BLE discovery. The scan itself sleeps 5s, then each
-/// peripheral may require connect + service discovery — budget is ~10s of
-/// btleplug work even on a healthy adapter. We cap at 15s so a wedged
-/// CoreBluetooth future (common after sleep/wake) can't strand the boot
-/// state machine: on timeout we return an empty Vec, the spawned thread's
-/// `tx.send(..)` unblocks, `ble_pending` clears, and the LCD can leave the
-/// boot animation.
-const BLE_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Discover BLE lights and spawn one actor task per light on `rt`. Each
-/// actor owns its `Peripheral` and serializes writes; the returned `Light`s
-/// hold only the actor's command channel. Bounded by BLE_DISCOVERY_TIMEOUT.
-pub fn discover_ble(rt: &tokio::runtime::Runtime) -> Vec<Light> {
-    let handle = rt.handle().clone();
-    let lights = rt.block_on(async move {
-        match tokio::time::timeout(BLE_DISCOVERY_TIMEOUT, discover_ble_lights(handle)).await {
-            Ok(Ok(l)) => l,
-            Ok(Err(e)) => {
-                warn!("BLE discovery failed: {}", e);
-                Vec::new()
-            }
-            Err(_) => {
-                warn!("BLE discovery timed out after {:?}", BLE_DISCOVERY_TIMEOUT);
-                Vec::new()
-            }
-        }
-    });
+/// Same as `discover_serial` but skips ports whose label is already in
+/// `existing_names`. Used by the rescan button so we don't double-open a
+/// serial port that an existing `Light` still owns.
+pub fn discover_serial_excluding(existing_names: &std::collections::HashSet<String>) -> Vec<Light> {
+    info!("Serial: rescanning USB...");
+    let lights: Vec<Light> = discover_serial_lights()
+        .into_iter()
+        .filter(|l| !existing_names.contains(&l.name))
+        .collect();
+    info!("Serial: found {} new USB light(s)", lights.len());
     for light in &lights {
         info!("  - {}", light.name);
     }
     lights
+}
+
+/// Per-attempt scan windows used by `discover_ble`. The first attempt is the
+/// historical 5s budget; later attempts widen the window because devices that
+/// missed the first window are usually slow to advertise (BT stack warm-up
+/// after a USB reattach or wake). Each entry budgets ~5s of post-scan work
+/// (connect + service discovery) on top of the scan time.
+const BLE_SCAN_ATTEMPTS_SECS: &[u64] = &[5, 8, 10];
+
+/// Per-attempt hard ceiling: scan time + 10s for connect/service discovery.
+/// On timeout we return what we have so far so the boot state machine can
+/// progress and the LCD can leave the boot animation.
+fn ble_attempt_timeout(scan_secs: u64) -> Duration {
+    Duration::from_secs(scan_secs + 10)
+}
+
+/// Discover BLE lights and spawn one actor task per light on `rt`. Each
+/// actor owns its `Peripheral` and serializes writes; the returned `Light`s
+/// hold only the actor's command channel.
+///
+/// Skips peripherals whose name is in `existing_names` so a rescan does not
+/// spawn duplicate actors for already-tracked lights.
+///
+/// If `expected` is set, retries the scan with progressively longer windows
+/// until at least that many *new* lights are connected (relative to
+/// `existing_names`). If unset, performs a single 5s scan.
+pub fn discover_ble(
+    rt: &tokio::runtime::Runtime,
+    existing_names: std::collections::HashSet<String>,
+    expected: Option<usize>,
+) -> Vec<Light> {
+    let mut found: Vec<Light> = Vec::new();
+    let mut already: std::collections::HashSet<String> = existing_names;
+
+    let attempts: &[u64] = if expected.is_some() {
+        BLE_SCAN_ATTEMPTS_SECS
+    } else {
+        &BLE_SCAN_ATTEMPTS_SECS[..1]
+    };
+
+    for (idx, &scan_secs) in attempts.iter().enumerate() {
+        // Goal for this call is "new lights found", measured against the
+        // names we already had before this discovery started.
+        let need_more = match expected {
+            Some(n) => found.len() < n,
+            None => found.is_empty() && idx == 0,
+        };
+        if !need_more {
+            break;
+        }
+        if idx > 0 {
+            info!(
+                "BLE: only {} light(s) found, retrying with {}s window (attempt {}/{})",
+                found.len(),
+                scan_secs,
+                idx + 1,
+                attempts.len()
+            );
+        }
+
+        let handle = rt.handle().clone();
+        let names_snapshot = already.clone();
+        let timeout = ble_attempt_timeout(scan_secs);
+        let attempt = rt.block_on(async move {
+            match tokio::time::timeout(
+                timeout,
+                discover_ble_lights(handle, names_snapshot, scan_secs),
+            )
+            .await
+            {
+                Ok(Ok(l)) => l,
+                Ok(Err(e)) => {
+                    warn!("BLE discovery failed: {}", e);
+                    Vec::new()
+                }
+                Err(_) => {
+                    warn!("BLE discovery timed out after {:?}", timeout);
+                    Vec::new()
+                }
+            }
+        });
+        for light in &attempt {
+            info!("  - {}", light.name);
+            already.insert(light.name.clone());
+        }
+        found.extend(attempt);
+    }
+
+    found
 }
 
 #[cfg(test)]
