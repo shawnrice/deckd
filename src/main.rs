@@ -1,5 +1,6 @@
 mod actions;
 mod audio;
+mod ble_native;
 mod boot;
 mod camera;
 mod config;
