@@ -224,20 +224,28 @@ const BLE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 const BLE_STRIKE_THRESHOLD: u8 = 3;
 const BLE_RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BLE_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
-/// Brief scan window inside the reconnect handshake. CoreBluetooth caches
-/// stale `Peripheral` handles after an unclean link drop — `connect()` on
-/// the cached handle then hangs until our outer timeout. A short rescan
-/// gives us a fresh handle keyed by `PeripheralId` (UUID) so the connect
-/// runs against current BLE state.
-const BLE_RECONNECT_SCAN: Duration = Duration::from_secs(3);
+/// Scan window inside the reconnect handshake. NEEWER GL1 PRO firmware
+/// advertises infrequently after a disconnect — ble_probe measurements
+/// show roughly one advertisement per 20s. Anything shorter than ~25s
+/// misses the advertisement window most of the time and the actor never
+/// recovers. 30s reliably caught both lights in every measured run.
+const BLE_RECONNECT_SCAN: Duration = Duration::from_secs(30);
 
-/// Timeout for the reconnect handshake (rescan + disconnect + connect + discover).
+/// Per-step timeout for `discover_services` after a successful connect.
+/// On macOS this can hang indefinitely if another process is also
+/// holding the peripheral or btleplug's internal event loop is mid-
+/// teardown; we bound it so a stuck discovery can't eat the whole
+/// reconnect timeout and we can fall through to backoff + retry.
+const BLE_DISCOVER_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Timeout for the whole reconnect handshake. Budget: BLE_RECONNECT_SCAN
+/// (30s) + connect (~5s observed) + BLE_DISCOVER_TIMEOUT (8s) + slack.
 /// CoreBluetooth's per-peripheral event receiver can die under wake-from-sleep
 /// or after a forced disconnect, leaving the next `connect().await` parked
 /// forever waiting for an event that will never arrive. Without this bound,
 /// the rescan button silently wedges the actor — same hang shape as the
 /// write path before BLE_WRITE_TIMEOUT was added.
-const BLE_RECONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const BLE_RECONNECT_TIMEOUT: Duration = Duration::from_secs(50);
 
 impl Light {
     /// Re-send GL1 handshake if it's been more than 10 seconds since the last one
@@ -620,10 +628,11 @@ async fn reconnect(name: &str, id: &PeripheralId) -> Result<Peripheral, String> 
             .ok_or_else(|| "not seen in rescan".to_string())?;
 
         fresh.connect().await.map_err(|e| format!("connect: {}", e))?;
-        fresh
-            .discover_services()
-            .await
-            .map_err(|e| format!("discover_services: {}", e))?;
+        match tokio::time::timeout(BLE_DISCOVER_TIMEOUT, fresh.discover_services()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(format!("discover_services: {}", e)),
+            Err(_) => return Err(format!("discover_services timed out after {:?}", BLE_DISCOVER_TIMEOUT)),
+        }
         Ok::<Peripheral, String>(fresh)
     };
     match tokio::time::timeout(BLE_RECONNECT_TIMEOUT, fut).await {
