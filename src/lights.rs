@@ -224,13 +224,20 @@ const BLE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 const BLE_STRIKE_THRESHOLD: u8 = 3;
 const BLE_RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 const BLE_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
-/// Timeout for the reconnect handshake (disconnect + connect + discover).
+/// Brief scan window inside the reconnect handshake. CoreBluetooth caches
+/// stale `Peripheral` handles after an unclean link drop — `connect()` on
+/// the cached handle then hangs until our outer timeout. A short rescan
+/// gives us a fresh handle keyed by `PeripheralId` (UUID) so the connect
+/// runs against current BLE state.
+const BLE_RECONNECT_SCAN: Duration = Duration::from_secs(3);
+
+/// Timeout for the reconnect handshake (rescan + disconnect + connect + discover).
 /// CoreBluetooth's per-peripheral event receiver can die under wake-from-sleep
 /// or after a forced disconnect, leaving the next `connect().await` parked
 /// forever waiting for an event that will never arrive. Without this bound,
 /// the rescan button silently wedges the actor — same hang shape as the
 /// write path before BLE_WRITE_TIMEOUT was added.
-const BLE_RECONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const BLE_RECONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl Light {
     /// Re-send GL1 handshake if it's been more than 10 seconds since the last one
@@ -385,7 +392,7 @@ pub fn force_reconnect_all(lights: &mut [Light]) {
 // ── BLE transport ───────────────────────────────────────────────
 
 use btleplug::api::{Central, Manager as _, Peripheral as _, ScanFilter, WriteType};
-use btleplug::platform::{Manager, Peripheral};
+use btleplug::platform::{Manager, Peripheral, PeripheralId};
 use uuid::Uuid;
 
 const NEEWER_SERVICE: Uuid = Uuid::from_u128(0x69400001_b5a3_f393_e0a9_e50e24dcca99);
@@ -419,11 +426,15 @@ async fn ble_write(peripheral: &Peripheral, cmd: &[u8]) -> Result<(), String> {
 /// warnings forever.
 async fn ble_actor(
     name: String,
-    peripheral: Peripheral,
+    mut peripheral: Peripheral,
     is_gl1: bool,
     mut rx: mpsc::Receiver<BleCmd>,
     reconnect_signal: Arc<Notify>,
 ) {
+    // Stable identity for the physical light. The `Peripheral` value can be
+    // replaced with a fresh handle from a rescan, but the id (CoreBluetooth
+    // UUID) follows the device and is what we look up on.
+    let id: PeripheralId = peripheral.id();
     // Last known desired state, replayed after every reconnect so the light
     // ends up matching what the user has been tapping during the outage.
     let mut last_brightness: u8 = 50;
@@ -440,13 +451,12 @@ async fn ble_actor(
     loop {
         if !connected {
             // Disconnected: wait `backoff`, but stay responsive to a manual
-            // reconnect kick so the rescan button collapses the wait.
-            let mut force_now = false;
+            // reconnect kick. The select! collapses the wait on notify, so
+            // we don't need to mutate `backoff` here — the next failure
+            // will still double from its current value.
             tokio::select! {
                 _ = tokio::time::sleep(backoff) => {}
-                _ = reconnect_signal.notified() => {
-                    force_now = true;
-                }
+                _ = reconnect_signal.notified() => {}
                 msg = rx.recv() => {
                     if msg.is_none() {
                         return;
@@ -456,12 +466,14 @@ async fn ble_actor(
                     // reconnect.
                 }
             }
-            if force_now {
-                backoff = Duration::from_millis(0);
-            }
 
-            match reconnect(&peripheral).await {
-                Ok(()) => {
+            match reconnect(&name, &id).await {
+                Ok(fresh) => {
+                    // Swap to the freshly-discovered handle. The previous
+                    // one may be poisoned by CoreBluetooth's stale-cache
+                    // behavior, which is why connect() was hanging in the
+                    // first place.
+                    peripheral = fresh;
                     info!("[{}] BLE reconnected", name);
                     connected = true;
                     strikes = 0;
@@ -472,7 +484,10 @@ async fn ble_actor(
                 }
                 Err(e) => {
                     warn!("[{}] BLE reconnect failed: {} (backoff {:?})", name, e, backoff);
-                    backoff = (backoff * 2).min(BLE_RECONNECT_BACKOFF_MAX);
+                    // max() guards against the zero-fixed-point trap: if
+                    // backoff ever lands at 0, doubling stays at 0 forever.
+                    backoff = (backoff.max(BLE_RECONNECT_BACKOFF_INITIAL) * 2)
+                        .min(BLE_RECONNECT_BACKOFF_MAX);
                 }
             }
             continue;
@@ -486,7 +501,9 @@ async fn ble_actor(
                 // disconnect anyway with its own timeout.
                 let _ = tokio::time::timeout(BLE_RECONNECT_TIMEOUT, peripheral.disconnect()).await;
                 connected = false;
-                backoff = Duration::from_millis(0);
+                // Reset to INITIAL (not 0) so the doubling has somewhere
+                // to grow from if the first reconnect attempt also fails.
+                backoff = BLE_RECONNECT_BACKOFF_INITIAL;
                 continue;
             }
             msg = rx.recv() => {
@@ -557,15 +574,57 @@ async fn handle_write_result(
     }
 }
 
-async fn reconnect(peripheral: &Peripheral) -> Result<(), String> {
-    // disconnect() is a local op against the OS; it's safe to call even on
-    // a wedged handle and clears any half-dead CoreBluetooth state before
-    // we ask for a fresh connection.
+/// Reconnect by re-building btleplug from scratch and re-discovering the
+/// peripheral. None of btleplug's CoreBluetooth handles (Manager, Adapter,
+/// Peripheral) survive a `state==poweredOff` event — when Bluetooth toggles
+/// off/on, the internal event receivers die ("Event receiver died" in
+/// btleplug logs) and every cached handle becomes a wedged stub whose
+/// awaits hang forever. The only reliable recovery is to throw out every
+/// cached handle and ask the OS again.
+///
+/// Returns the freshly-discovered `Peripheral` so the actor can swap its
+/// handle. We deliberately do *not* call `old.disconnect()` — on a dead
+/// handle that call can itself hang, eating the entire timeout.
+async fn reconnect(name: &str, id: &PeripheralId) -> Result<Peripheral, String> {
     let fut = async {
-        let _ = peripheral.disconnect().await;
-        peripheral.connect().await.map_err(|e| format!("connect: {}", e))?;
-        peripheral.discover_services().await.map_err(|e| format!("discover_services: {}", e))?;
-        Ok::<(), String>(())
+        // Fresh Manager + Adapter every call. Manager::new() allocates a
+        // new CBCentralManager; if BT just came back from poweredOff this
+        // may briefly wait for the central's poweredOn callback.
+        let manager = Manager::new().await.map_err(|e| format!("manager: {}", e))?;
+        let adapter = manager
+            .adapters()
+            .await
+            .map_err(|e| format!("adapters: {}", e))?
+            .into_iter()
+            .next()
+            .ok_or("no adapter")?;
+
+        // Brief scan so CoreBluetooth re-issues the CBPeripheral. Other
+        // actors may be scanning concurrently against their own Manager
+        // instances — that's fine; CoreBluetooth allows multiple centrals.
+        info!("[{}] BLE: rescanning for {:?}", name, BLE_RECONNECT_SCAN);
+        adapter
+            .start_scan(ScanFilter::default())
+            .await
+            .map_err(|e| format!("scan: {}", e))?;
+        tokio::time::sleep(BLE_RECONNECT_SCAN).await;
+        let _ = adapter.stop_scan().await;
+
+        let peripherals = adapter
+            .peripherals()
+            .await
+            .map_err(|e| format!("peripherals: {}", e))?;
+        let fresh = peripherals
+            .into_iter()
+            .find(|p| &p.id() == id)
+            .ok_or_else(|| "not seen in rescan".to_string())?;
+
+        fresh.connect().await.map_err(|e| format!("connect: {}", e))?;
+        fresh
+            .discover_services()
+            .await
+            .map_err(|e| format!("discover_services: {}", e))?;
+        Ok::<Peripheral, String>(fresh)
     };
     match tokio::time::timeout(BLE_RECONNECT_TIMEOUT, fut).await {
         Ok(r) => r,
