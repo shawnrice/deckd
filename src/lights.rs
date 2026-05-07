@@ -13,6 +13,38 @@ use crate::ble_native::{BleManager, BlePeripheral};
 /// Same value the original btleplug-based actor used.
 const NEEWER_WRITE_CHAR: Uuid = Uuid::from_u128(0x69400002_b5a3_f393_e0a9_e50e24dcca99);
 
+/// Notification characteristic. The light sends back state updates here
+/// after writes (e.g., power on/off transitions, current channel).
+/// Format per NeewerLite-Python and the Home Assistant integration:
+///   data[0] == 0x01 → channel/mode status, data[3] is current channel
+///   data[0] == 0x02 → power status, data[3]==1 ON, data[3]==2 STANDBY
+const NEEWER_NOTIFY_CHAR: Uuid = Uuid::from_u128(0x69400003_b5a3_f393_e0a9_e50e24dcca99);
+
+/// Decoded snapshot of what the light most recently reported via the
+/// notify characteristic. None means we haven't received any notifications
+/// for this light yet (just connected, or not subscribed). Power state is
+/// the only field most lights actually emit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotifyState {
+    /// Reported power state. Some(true) = ON, Some(false) = STANDBY.
+    Power(bool),
+    /// Reported channel/mode index (light-specific meaning).
+    Channel(u8),
+    /// Bytes we received but couldn't classify. Logged but not actioned.
+    Unknown,
+}
+
+fn parse_notify(bytes: &[u8]) -> NotifyState {
+    if bytes.len() < 4 {
+        return NotifyState::Unknown;
+    }
+    match bytes[0] {
+        0x01 => NotifyState::Channel(bytes[3]),
+        0x02 => NotifyState::Power(bytes[3] == 1),
+        _ => NotifyState::Unknown,
+    }
+}
+
 // ── Protocol (shared across all transports) ─────────────────────
 
 const CMD_PREFIX: u8 = 0x78;
@@ -293,6 +325,17 @@ impl Light {
             // resync state via the heartbeat.
             let _ = manager.kick_reconnect(peripheral);
         }
+    }
+
+    /// Read what the light most recently reported via its notify
+    /// characteristic, decoded. None for non-BLE lights or BLE lights that
+    /// haven't sent a notification yet. Power(true) means the light's
+    /// firmware reported it's ON; Power(false) means STANDBY.
+    pub fn actual_notify_state(&self) -> Option<NotifyState> {
+        let Transport::Ble { peripheral, manager, .. } = &self.transport else {
+            return None;
+        };
+        manager.last_notify(peripheral).map(|b| parse_notify(&b))
     }
 
 
@@ -579,6 +622,10 @@ pub fn discover_ble(
             return Vec::new();
         }
     };
+    // Auto-subscribe to the Neewer notify characteristic on every peripheral
+    // we (re)discover. The manager re-attaches the subscription on every
+    // reconnect, so a drop+auto-reconnect doesn't lose state visibility.
+    manager.watch_characteristic(NEEWER_NOTIFY_CHAR);
 
     let mut stored = load_stored_peripherals();
     let mut lights: Vec<Light> = Vec::new();

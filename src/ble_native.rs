@@ -77,6 +77,15 @@ pub struct DelegateState {
     /// callbacks accumulate into this map, keyed by peripheral id. Cleared
     /// after each scan call collects results.
     scan_buf: Mutex<Option<HashMap<Uuid, ScannedAdvertisement>>>,
+    /// Characteristic UUIDs to enable notifications on automatically when
+    /// they appear via didDiscoverCharacteristics. Lets the manager handle
+    /// "subscribe to NEEWER_NOTIFY_CHAR after every reconnect" without the
+    /// caller having to coordinate with discovery timing.
+    auto_subscribe: Mutex<Vec<Uuid>>,
+    /// Latest notification bytes per peripheral, keyed by id. Updated on
+    /// every didUpdateValueForCharacteristic. Callers use
+    /// `BleManager::last_notify(peripheral)` to read the most recent.
+    last_notify: Mutex<HashMap<Uuid, Vec<u8>>>,
 }
 
 #[derive(Clone)]
@@ -229,7 +238,7 @@ define_class!(
         fn peripheral_did_discover_chars(
             &self,
             peripheral: &CBPeripheral,
-            _service: &CBService,
+            service: &CBService,
             error: Option<&NSError>,
         ) {
             let id = unsafe { peripheral.identifier() };
@@ -239,9 +248,58 @@ define_class!(
                 None => Ok(()),
             };
             debug!("BLE: didDiscoverChars {} -> {:?}", uuid, result);
+            // Auto-subscribe to any characteristic in our watch list.
+            // Lets writers (deckd::lights) ask for notifications once at
+            // boot and have them re-attached on every reconnect without
+            // additional plumbing.
+            if result.is_ok() {
+                let watched: Vec<Uuid> = self.ivars().auto_subscribe.lock().unwrap().clone();
+                if !watched.is_empty() {
+                    if let Some(chars) = unsafe { service.characteristics() } {
+                        for c in chars.iter() {
+                            let cb_uuid = unsafe { c.UUID() };
+                            let s = unsafe { cb_uuid.UUIDString() }.to_string();
+                            for target in &watched {
+                                if uuid_str_eq(&s, *target) {
+                                    info!("BLE: subscribing notify on {} for {}", target, uuid);
+                                    unsafe {
+                                        peripheral.setNotifyValue_forCharacteristic(true, &c)
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(tx) = self.ivars().pending_chars.lock().unwrap().remove(&uuid) {
                 let _ = tx.send(result);
             }
+        }
+
+        #[unsafe(method(peripheral:didUpdateValueForCharacteristic:error:))]
+        fn peripheral_did_update_value(
+            &self,
+            peripheral: &CBPeripheral,
+            characteristic: &CBCharacteristic,
+            error: Option<&NSError>,
+        ) {
+            let id = unsafe { peripheral.identifier() };
+            let uuid = nsuuid_to_uuid(&id);
+            if let Some(e) = error {
+                warn!("BLE: notify error for {}: {}", uuid, e.localizedDescription());
+                return;
+            }
+            let value_opt = unsafe { characteristic.value() };
+            let Some(value) = value_opt else { return };
+            // NSData → Vec<u8>. The bytes API on objc2-foundation's NSData
+            // returns &[u8] tied to the NSData's lifetime; copy out.
+            let bytes: Vec<u8> = value.to_vec();
+            debug!("BLE: notify from {}: {:02x?}", uuid, bytes);
+            self.ivars()
+                .last_notify
+                .lock()
+                .unwrap()
+                .insert(uuid, bytes);
         }
     }
 );
@@ -256,6 +314,8 @@ impl BleDelegate {
             central: Mutex::new(None),
             names: Mutex::new(HashMap::new()),
             scan_buf: Mutex::new(None),
+            auto_subscribe: Mutex::new(Vec::new()),
+            last_notify: Mutex::new(HashMap::new()),
         };
         let alloc = Self::alloc().set_ivars(ivars);
         unsafe { msg_send![super(alloc), init] }
@@ -406,6 +466,36 @@ impl BleManager {
         unsafe { self.central.stopScan() };
         let buf = self.delegate.ivars().scan_buf.lock().unwrap().take();
         buf.map(|m| m.into_values().collect()).unwrap_or_default()
+    }
+
+    /// Register a characteristic UUID we want notifications for. The
+    /// delegate auto-subscribes on every didDiscoverCharacteristics, so a
+    /// reconnect doesn't require the caller to re-issue this — set it once
+    /// after BleManager::new() and the manager keeps the subscription
+    /// attached for the lifetime of the process.
+    pub fn watch_characteristic(&self, char_uuid: Uuid) {
+        self.delegate
+            .ivars()
+            .auto_subscribe
+            .lock()
+            .unwrap()
+            .push(char_uuid);
+    }
+
+    /// Latest bytes received via notification on any watched characteristic
+    /// for `peripheral`, or None if nothing has been received yet (or the
+    /// peripheral has never been connected). Per the NEEWER protocol the
+    /// caller decodes:
+    ///   data[0] == 0x01 → channel/mode status, data[3] is current channel
+    ///   data[0] == 0x02 → power status, data[3]==1 ON, data[3]==2 STANDBY
+    pub fn last_notify(&self, peripheral: &BlePeripheral) -> Option<Vec<u8>> {
+        self.delegate
+            .ivars()
+            .last_notify
+            .lock()
+            .unwrap()
+            .get(&peripheral.uuid)
+            .cloned()
     }
 
     /// Synchronous, fire-and-forget connect kick. Used by the rescan path
