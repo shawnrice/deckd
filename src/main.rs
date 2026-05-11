@@ -611,7 +611,27 @@ fn start_daemon() {
 
         let poll_result = deck::poll_and_dispatch(&deck, &cfg, &page_stack, &mut read_errors, &mut touch_state);
         if poll_result.is_err() {
-            break;
+            // The HID endpoint stalled (typically kIOReturnNotReady from a
+            // back-to-back LCD write). The deck is almost always still on the
+            // bus — reopen the handle in-place to avoid a launchd respawn and
+            // a full boot animation cycle.
+            warn!("Stream Deck handle stalled; attempting in-place reconnect");
+            match deck::reconnect_blocking(std::time::Duration::from_secs(30)) {
+                Ok(new_deck) => {
+                    deck = new_deck;
+                    deck.set_brightness(cfg.brightness.unwrap_or(80))
+                        .unwrap_or_else(|e| error!("Failed to set brightness after reconnect: {}", e));
+                    render_page(&mut deck, &cfg, &page_stack);
+                    last_lcd_refresh = Instant::now() - lcd_refresh_interval;
+                    read_errors = 0;
+                    info!("Reconnected to Stream Deck in-place");
+                    continue;
+                }
+                Err(e) => {
+                    error!("In-place reconnect failed after 30s ({}); exiting for launchd respawn", e);
+                    break;
+                }
+            }
         }
         if let Ok(Some(result)) = poll_result {
             match result {

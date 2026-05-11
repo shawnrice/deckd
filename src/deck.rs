@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use elgato_streamdeck::{StreamDeck, StreamDeckInput, list_devices, new_hidapi};
 use log::{debug, info, warn};
@@ -55,6 +55,25 @@ pub fn connect() -> Result<StreamDeck, Box<dyn std::error::Error>> {
 
     let deck = StreamDeck::connect(&hidapi, *kind, serial)?;
     Ok(deck)
+}
+
+/// Try to reopen the Stream Deck after an in-process disconnect (typically a
+/// stalled HID endpoint, not a real USB removal). Retries every 250ms until
+/// `budget` elapses. Returns `Err` if the device never comes back in time —
+/// caller should then exit and let launchd respawn.
+pub fn reconnect_blocking(budget: Duration) -> Result<StreamDeck, Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + budget;
+    let mut last_err: Option<Box<dyn std::error::Error>> = None;
+    while Instant::now() < deadline {
+        match connect() {
+            Ok(deck) => return Ok(deck),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "reconnect timed out".into()))
 }
 
 fn handle_action(action: &Action) -> Option<InputResult> {

@@ -688,6 +688,10 @@ fn write_lcd_segment(deck: &mut StreamDeck, idx: u8, img: &RgbaImage, segment_wi
         }
         Err(e) => error!("Failed to convert LCD image {}: {}", idx, e),
     }
+    // Yield briefly so back-to-back segment writes don't race the HID
+    // endpoint and trip kIOReturnNotReady, which cascades into a fake
+    // "Device is disconnected" and forces a respawn.
+    std::thread::sleep(std::time::Duration::from_millis(2));
 }
 
 /// Render a wide now-playing display across two LCD segments
