@@ -13,6 +13,7 @@ mod render;
 mod soundboard;
 mod sysmon;
 mod tamagotchi;
+mod usb_watch;
 mod uvc;
 mod timer;
 
@@ -385,13 +386,53 @@ fn start_daemon() {
     signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&reload_flag))
         .expect("Failed to register SIGHUP handler");
 
-    let mut deck = match deck::connect() {
-        Ok(d) => d,
+    // Start USB hotplug watcher before the first connect attempt so we never
+    // miss an attach event that races with our enumeration. With enumerate(true),
+    // the watcher fires `Attached` immediately for any deck already on the bus.
+    let usb_events = match usb_watch::start() {
+        Ok(rx) => Some(rx),
         Err(e) => {
-            error!("Failed to connect to Stream Deck: {}", e);
-            std::process::exit(1);
+            warn!("USB hotplug unavailable ({}); will fall back to in-process retry only", e);
+            None
         }
     };
+
+    let mut deck = loop {
+        match deck::connect() {
+            Ok(d) => break d,
+            Err(e) => match usb_events.as_ref() {
+                Some(rx) => {
+                    info!("Stream Deck not present at startup ({}); waiting for USB attach event", e);
+                    // Block until the kernel reports an attach. Drain any
+                    // queued attach events first in case one arrived while
+                    // we were enumerating.
+                    loop {
+                        match rx.recv() {
+                            Ok(usb_watch::DeckEvent::Attached) => break,
+                            Ok(usb_watch::DeckEvent::Detached) => continue,
+                            Err(_) => {
+                                error!("USB hotplug channel closed; exiting for launchd respawn");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    // Tiny grace period: macOS HID device matching can lag
+                    // libusb's USB device announcement by ~100ms.
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                None => {
+                    error!("Failed to connect to Stream Deck: {}", e);
+                    std::process::exit(1);
+                }
+            },
+        }
+    };
+
+    // Drain any leftover hotplug events queued during the connect handshake
+    // so the main loop doesn't see a stale Attached and treat it as a transition.
+    if let Some(rx) = usb_events.as_ref() {
+        while rx.try_recv().is_ok() {}
+    }
 
     info!(
         "Connected to {} (serial: {})",
@@ -399,8 +440,12 @@ fn start_daemon() {
         deck.serial_number().unwrap_or_else(|_| "unknown".into()),
     );
 
-    deck.set_brightness(cfg.brightness.unwrap_or(80))
-        .unwrap_or_else(|e| error!("Failed to set brightness: {}", e));
+    {
+        let b = cfg.brightness.unwrap_or(80);
+        info!("Setting deck brightness to {} (startup)", b);
+        deck.set_brightness(b)
+            .unwrap_or_else(|e| error!("Failed to set brightness: {}", e));
+    }
 
     // ── Boot + discovery ──────────────────────────────────────────
     // Check if we're restarting after a sleep/wake (stamp file < 30s old)
@@ -460,8 +505,13 @@ fn start_daemon() {
     let dash_state = dashboard::new_shared();
     dashboard::start_poller(Arc::clone(&dash_state), cfg.github_repo.clone(), cfg.monitoring.clone());
 
-    // Camera state
+    // Camera state. Sync at startup so the first PTZ knob interaction is
+    // relative to the camera's actual persisted position — not the (0,0,1x)
+    // default in CameraState::new. The camera persists pan/tilt/zoom across
+    // power cycles, so without this the first knob movement after a deckd
+    // restart snaps the camera toward our assumed origin.
     let mut cam_state = camera::CameraState::new(cfg.camera.clone());
+    cam_state.sync_from_device();
 
     // Timer
     let timer_state = timer::new_shared();
@@ -520,10 +570,26 @@ fn start_daemon() {
     // Sleep/wake detection: compare wall-clock delta across iterations.
     // If wall clock jumps forward much more than the loop period, we slept.
     let mut last_wake_check = std::time::SystemTime::now();
+    // Periodic brightness re-assertion. macOS display sleep can put the deck's
+    // USB endpoint into selective suspend without ever pausing this process;
+    // wall clock does not gap, so the wake-detection branch below cannot fire.
+    // Reasserting brightness on a slow cadence is the fallback that auto-relights
+    // the panel even if no button is pressed and no sleep gap is detected.
+    let mut last_brightness_reassert = Instant::now();
+    let brightness_reassert_interval = std::time::Duration::from_secs(60);
     while !shutdown.load(Ordering::Relaxed) {
-        // Detect wake from sleep: wall-clock gap >> loop iteration time
+        // Detect wake from sleep: wall-clock gap >> loop iteration time.
+        // Normal iteration cadence is ~50ms (the deck input poll timeout), so a
+        // gap of >2s reliably means the process was suspended (system sleep,
+        // SIGSTOP, etc.). Note: display-only sleep does NOT pause the process,
+        // so wall clock keeps ticking — see last_brightness_reassert below.
         if let Ok(elapsed) = std::time::SystemTime::now().duration_since(last_wake_check) {
-            if elapsed > std::time::Duration::from_secs(10) {
+            if elapsed > std::time::Duration::from_millis(500) {
+                // Log noticeable but sub-threshold gaps so we can see if display
+                // sleep events ever produce a measurable but small bump here.
+                log::debug!("Loop iteration wall-clock gap: {:?}", elapsed);
+            }
+            if elapsed > std::time::Duration::from_secs(2) {
                 info!("Detected wake from sleep (gap: {:?}), refreshing deck state", elapsed);
                 // BLE links don't survive macOS sleep — force every actor
                 // to tear down and reconnect.
@@ -547,10 +613,26 @@ fn start_daemon() {
                 // Force LCD refresh next tick
                 last_lcd_refresh = Instant::now() - lcd_refresh_interval;
                 // Restore brightness (in case firmware dimmed it)
-                deck.set_brightness(cfg.brightness.unwrap_or(80)).ok();
+                let b = cfg.brightness.unwrap_or(80);
+                info!("Setting deck brightness to {} (wake from sleep)", b);
+                if let Err(e) = deck.set_brightness(b) {
+                    warn!("Failed to set brightness on wake: {}", e);
+                }
+                last_brightness_reassert = Instant::now();
             }
         }
         last_wake_check = std::time::SystemTime::now();
+
+        // Periodic brightness re-assertion. See declaration above for rationale.
+        if last_brightness_reassert.elapsed() >= brightness_reassert_interval {
+            let b = cfg.brightness.unwrap_or(80);
+            if let Err(e) = deck.set_brightness(b) {
+                warn!("Failed periodic brightness re-assert: {}", e);
+            } else {
+                log::debug!("Periodic brightness re-assert: {}", b);
+            }
+            last_brightness_reassert = Instant::now();
+        }
 
         // Check if BLE scan completed in background
         if let Some(ref rx) = ble_pending {
@@ -609,21 +691,86 @@ fn start_daemon() {
 
         // BLE keepalive is owned by each light's actor task — no main-loop work needed.
 
+        // Drain pending USB hotplug events and remember the most recent one.
+        // We can't just count detaches: a Detached followed by an Attached
+        // (which can happen within a single main-loop tick during a quick
+        // re-enumeration) means the device is currently present. Tracking
+        // only the latest event preserves the actual final state.
+        let last_usb_event = usb_events.as_ref().and_then(|rx| {
+            let mut last = None;
+            while let Ok(ev) = rx.try_recv() {
+                last = Some(ev);
+            }
+            last
+        });
+        let usb_present_now = match last_usb_event {
+            Some(usb_watch::DeckEvent::Attached) => Some(true),
+            Some(usb_watch::DeckEvent::Detached) => Some(false),
+            None => None,
+        };
+
         let poll_result = deck::poll_and_dispatch(&deck, &cfg, &page_stack, &mut read_errors, &mut touch_state);
-        if poll_result.is_err() {
-            // The HID endpoint stalled (typically kIOReturnNotReady from a
-            // back-to-back LCD write). The deck is almost always still on the
-            // bus — reopen the handle in-place to avoid a launchd respawn and
-            // a full boot animation cycle.
-            warn!("Stream Deck handle stalled; attempting in-place reconnect");
+        let needs_reconnect = poll_result.is_err() || usb_present_now == Some(false);
+        if needs_reconnect {
+            // Either the HID endpoint stalled (kIOReturnNotReady from a
+            // back-to-back LCD write) or the kernel told us the device left
+            // the bus. The first case usually recovers in <1s; the second
+            // means we wait until the deck is plugged back in.
+            if usb_present_now == Some(false) {
+                warn!("Stream Deck detached; waiting for reattach");
+            } else {
+                warn!("Stream Deck handle stalled; attempting in-place reconnect");
+            }
+
+            // If the kernel says the deck is gone, block on the hotplug
+            // channel rather than spinning reconnect attempts. Re-check
+            // current presence on every wake in case the queue oscillated.
+            if usb_present_now == Some(false)
+                && let Some(rx) = usb_events.as_ref()
+            {
+                let mut present = false;
+                while !present {
+                    match rx.recv() {
+                        Ok(usb_watch::DeckEvent::Attached) => present = true,
+                        Ok(usb_watch::DeckEvent::Detached) => {}
+                        Err(_) => {
+                            error!("USB hotplug channel closed; exiting for launchd respawn");
+                            break;
+                        }
+                    }
+                }
+                // Drain any further oscillation events that arrived while
+                // we were waking, then collapse to the final state.
+                while let Ok(ev) = rx.try_recv() {
+                    present = matches!(ev, usb_watch::DeckEvent::Attached);
+                }
+                if !present {
+                    // The device flapped Detached again while we were
+                    // setting up — go around once more.
+                    continue;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+
             match deck::reconnect_blocking(std::time::Duration::from_secs(30)) {
                 Ok(new_deck) => {
                     deck = new_deck;
-                    deck.set_brightness(cfg.brightness.unwrap_or(80))
+                    let b = cfg.brightness.unwrap_or(80);
+                    info!("Setting deck brightness to {} (after reconnect)", b);
+                    deck.set_brightness(b)
                         .unwrap_or_else(|e| error!("Failed to set brightness after reconnect: {}", e));
+                    last_brightness_reassert = Instant::now();
+                    // The Neewer USB-serial lights share the same hub as the
+                    // deck. When the hub blips, their serial handles go to
+                    // EPIPE — refresh them now while we know the bus is
+                    // healthy again. BLE lights are self-healing.
+                    lights::refresh_serial(&mut all_lights);
                     render_page(&mut deck, &cfg, &page_stack);
                     last_lcd_refresh = Instant::now() - lcd_refresh_interval;
                     read_errors = 0;
+                    if let Some(rx) = usb_events.as_ref() {
+                        while rx.try_recv().is_ok() {}
+                    }
                     info!("Reconnected to Stream Deck in-place");
                     continue;
                 }
@@ -639,11 +786,25 @@ fn start_daemon() {
                     info!("Switching to page: {}", new_page);
                     push_page(&mut page_stack, new_page);
                     render_page(&mut deck, &cfg, &page_stack);
+                    // Re-assert brightness on every page switch. macOS display
+                    // sleep can trigger USB selective suspend, which the deck
+                    // firmware appears to use as a cue to drop its backlight.
+                    // Renders silently land on a dark panel until brightness is
+                    // sent again. Cost is a single feature-report write.
+                    if let Err(e) = deck.set_brightness(cfg.brightness.unwrap_or(80)) {
+                        warn!("Failed to re-assert brightness on page switch: {}", e);
+                    }
+                    last_brightness_reassert = Instant::now();
                     let cp = current_page(&page_stack);
-                    // Sync camera state when entering camera settings page
+                    // Sync camera state when entering any camera page. The
+                    // settings page needs it for the AF/AE/AWB/FOV/RL toggle
+                    // displays; the PTZ page needs it so pan/tilt/zoom knob
+                    // movements are relative to the camera's actual position.
                     if cp == "cam_settings" {
                         cam_state.sync_from_device();
                         render::render_camera_state_buttons(&mut deck, &cam_state);
+                    } else if cp == "camera" {
+                        cam_state.sync_from_device();
                     }
                     // Render stateful light toggle on entry
                     if cp == "keylights" {
