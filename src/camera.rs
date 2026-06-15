@@ -52,6 +52,17 @@ impl CameraState {
                 self.auto_wb = cur != 0;
             }
 
+            // Pan/tilt/zoom are absolute positions the camera persists across
+            // sessions — read them so the first knob movement is relative to
+            // the actual position, not a stale (0,0,1x) assumption.
+            if let Ok(z) = c.get_zoom() {
+                self.zoom = z;
+            }
+            if let Ok((pan, tilt)) = c.get_pantilt() {
+                self.pan = pan;
+                self.tilt = tilt;
+            }
+
             // Logitech XU
             self.has_xu = c.has_logitech_xu();
             if self.has_xu {
@@ -60,8 +71,9 @@ impl CameraState {
             }
             Ok(())
         });
-        info!("Camera state synced: AF={} AE={} AWB={} FOV={} RL={}",
-            self.auto_focus, self.auto_exposure, self.auto_wb, self.fov, self.rightlight);
+        info!("Camera state synced: AF={} AE={} AWB={} FOV={} RL={} zoom={} pan={} tilt={}",
+            self.auto_focus, self.auto_exposure, self.auto_wb, self.fov, self.rightlight,
+            self.zoom, self.pan, self.tilt);
     }
 }
 

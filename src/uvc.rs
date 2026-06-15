@@ -272,6 +272,14 @@ impl Camera {
         self.set_ct_control(CT_PANTILT_ABSOLUTE, &buf)
     }
 
+    pub fn get_pantilt(&self) -> Result<(i32, i32), String> {
+        let mut buf = [0u8; 8];
+        self.get_ct_control(CT_PANTILT_ABSOLUTE, &mut buf)?;
+        let pan = i32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let tilt = i32::from_le_bytes(buf[4..8].try_into().unwrap());
+        Ok((pan, tilt))
+    }
+
     pub fn set_focus_auto(&self, on: bool) -> Result<(), String> {
         self.set_ct_control(CT_FOCUS_AUTO, &[if on { 1 } else { 0 }])
     }
