@@ -205,6 +205,18 @@ pub struct Light {
     pub state: LightState,
 }
 
+/// Effective on-state for a light: prefer firmware-reported telemetry (BLE
+/// notify) when present, otherwise fall back to the last-commanded state.
+/// Telemetry catches cases where the light's physical button was pressed,
+/// where a BLE write was silently dropped, or where the firmware refused
+/// the command.
+fn effective_on(light: &Light) -> bool {
+    match light.actual_notify_state() {
+        Some(NotifyState::Power(on)) => on,
+        _ => light.state.on,
+    }
+}
+
 #[allow(dead_code)]
 pub fn any_on(lights: &[Light]) -> bool {
     lights.iter().any(|l| l.state.on)
@@ -230,7 +242,13 @@ enum Transport {
         last_heartbeat: Instant,
     },
     Serial {
-        port: Box<dyn serialport::SerialPort>,
+        /// `None` once a write has failed and the handle was dropped; the next
+        /// write reopens it from `path`. Kept live the rest of the time.
+        port: Option<Box<dyn serialport::SerialPort>>,
+        path: String,
+        /// Last time we attempted a reopen. Throttles open() attempts so an
+        /// unplugged light can't turn a held-down button into an open() storm.
+        last_reopen: Instant,
     },
     Udp {
         socket: UdpSocket,
@@ -267,7 +285,7 @@ impl Light {
                 let cmd = cmd_power(on);
                 manager.write(peripheral, NEEWER_WRITE_CHAR, &cmd)
             }
-            Transport::Serial { port } => {
+            Transport::Serial { port, path, last_reopen } => {
                 // PL81: use brightness 0/100 since power command is unreliable
                 let cmd = if self.is_pl81 {
                     let brt = if on { 100 } else { 0 };
@@ -275,7 +293,7 @@ impl Light {
                 } else {
                     cmd_power(on)
                 };
-                serial_write(port, &cmd)
+                serial_write_healing(port, path, last_reopen, &cmd)
             }
             Transport::Udp { socket, broadcast_addr, .. } => {
                 let cmd = gl1_cmd_power(on);
@@ -285,7 +303,7 @@ impl Light {
     }
 
     pub fn toggle_power(&mut self) -> Result<(), String> {
-        let on = !self.state.on;
+        let on = !effective_on(self);
         self.set_power(on)
     }
 
@@ -350,7 +368,9 @@ impl Light {
             let temp_byte = kelvin_to_pl81_temp(self.state.color_temp_k);
             let cmd = pl81_cmd_cct(self.state.brightness, temp_byte);
             match &mut self.transport {
-                Transport::Serial { port } => serial_write(port, &cmd),
+                Transport::Serial { port, path, last_reopen } => {
+                    serial_write_healing(port, path, last_reopen, &cmd)
+                }
                 _ => Ok(()),
             }
         } else if self.is_gl1 {
@@ -375,9 +395,9 @@ impl Light {
                     let cmd = cmd_cct(self.state.brightness, self.state.color_temp_raw);
                     manager.write(peripheral, NEEWER_WRITE_CHAR, &cmd)
                 }
-                Transport::Serial { port } => {
+                Transport::Serial { port, path, last_reopen } => {
                     let cmd = cmd_cct(self.state.brightness, self.state.color_temp_raw);
-                    serial_write(port, &cmd)
+                    serial_write_healing(port, path, last_reopen, &cmd)
                 }
                 Transport::Udp { socket, broadcast_addr, .. } => {
                     let cmd = cmd_cct(self.state.brightness, self.state.color_temp_raw);
@@ -406,9 +426,62 @@ pub fn force_reconnect_all(lights: &mut [Light]) {
 
 // ── Serial transport ────────────────────────────────────────────
 
-fn serial_write(port: &mut Box<dyn serialport::SerialPort>, cmd: &[u8]) -> Result<(), String> {
-    port.write_all(cmd)
-        .map_err(|e| format!("Serial write: {}", e))
+const SERIAL_BAUD: u32 = 115200;
+const SERIAL_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Minimum gap between reopen attempts for one serial light. The PL81's USB
+/// serial fd dies (EPIPE) on a hub blip or USB selective-suspend without the
+/// Stream Deck necessarily dropping, and deckd has no other recovery path for
+/// it. This throttle keeps a genuinely-unplugged light from turning every
+/// queued command into an open() storm.
+const SERIAL_REOPEN_COOLDOWN: Duration = Duration::from_secs(3);
+
+/// An `Instant` far enough in the past that the first write is allowed to
+/// reopen immediately. Avoids `Instant - Duration` underflow panics on
+/// platforms where the monotonic clock starts near zero.
+fn stale_instant() -> Instant {
+    Instant::now()
+        .checked_sub(SERIAL_REOPEN_COOLDOWN)
+        .unwrap_or_else(Instant::now)
+}
+
+/// Write to a serial light, self-healing a dead handle. On the happy path this
+/// is just `write_all`. If the handle is gone or the write fails, we drop the
+/// handle and — at most once per `SERIAL_REOPEN_COOLDOWN` — reopen the port
+/// from `path` and retry the write exactly once. Bounded work per call, so a
+/// wedged port can never spin: failed reopens just return `Err` until the
+/// cooldown lapses again on the next user action.
+fn serial_write_healing(
+    port: &mut Option<Box<dyn serialport::SerialPort>>,
+    path: &str,
+    last_reopen: &mut Instant,
+    cmd: &[u8],
+) -> Result<(), String> {
+    // Fast path: live handle and the write lands.
+    if let Some(p) = port.as_mut()
+        && p.write_all(cmd).is_ok()
+    {
+        return Ok(());
+    }
+
+    // The handle is missing or the write just failed. Drop the dead one and
+    // consider reopening — but back off if we tried too recently.
+    *port = None;
+    if last_reopen.elapsed() < SERIAL_REOPEN_COOLDOWN {
+        return Err(format!("Serial {} unavailable (reopen on cooldown)", path));
+    }
+    *last_reopen = Instant::now();
+
+    let mut fresh = serialport::new(path, SERIAL_BAUD)
+        .timeout(SERIAL_TIMEOUT)
+        .open()
+        .map_err(|e| format!("Serial reopen {}: {}", path, e))?;
+    fresh
+        .write_all(cmd)
+        .map_err(|e| format!("Serial write after reopen {}: {}", path, e))?;
+    *port = Some(fresh);
+    warn!("Serial: reopened {} after write failure", path);
+    Ok(())
 }
 
 fn discover_serial_lights() -> Vec<Light> {
@@ -438,8 +511,8 @@ fn discover_serial_lights() -> Vec<Light> {
         };
 
         info!("Serial: found {} at {}", label, port.port_name);
-        match serialport::new(&port.port_name, 115200)
-            .timeout(Duration::from_millis(100))
+        match serialport::new(&port.port_name, SERIAL_BAUD)
+            .timeout(SERIAL_TIMEOUT)
             .open()
         {
             Ok(serial_port) => {
@@ -448,7 +521,9 @@ fn discover_serial_lights() -> Vec<Light> {
                     is_gl1: false,
                     is_pl81: true,
                     transport: Transport::Serial {
-                        port: serial_port,
+                        port: Some(serial_port),
+                        path: port.port_name.clone(),
+                        last_reopen: stale_instant(),
                     },
                     state: LightState::new(),
                 });
@@ -546,6 +621,20 @@ pub fn discover_serial() -> Vec<Light> {
         info!("  - {}", light.name);
     }
     lights
+}
+
+/// Drop any existing USB-serial lights and re-open the current set. Used
+/// after a USB hub blip / Stream Deck re-attach to recover from `EPIPE`s on
+/// stale serial handles. BLE lights are left untouched — their actors have
+/// their own reconnect path.
+pub fn refresh_serial(all_lights: &mut Vec<Light>) {
+    all_lights.retain(|l| !matches!(l.transport, Transport::Serial { .. }));
+    let fresh = discover_serial_lights();
+    info!("Serial: refreshed {} USB light(s) after USB event", fresh.len());
+    for l in &fresh {
+        info!("  - {}", l.name);
+    }
+    all_lights.extend(fresh);
 }
 
 /// Same as `discover_serial` but skips ports whose label is already in
