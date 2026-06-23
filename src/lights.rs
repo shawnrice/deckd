@@ -484,57 +484,76 @@ fn serial_write_healing(
     Ok(())
 }
 
-fn discover_serial_lights() -> Vec<Light> {
-    let ports = serialport::available_ports().unwrap_or_default();
-    let mut lights = Vec::new();
-
-    for port in ports {
-        // CH340 chips used by Neewer PL81 have vendor ID 0x1A86 (6790)
-        let is_neewer = match &port.port_type {
-            serialport::SerialPortType::UsbPort(usb) => usb.vid == 0x1A86,
-            _ => false,
-        };
-        // Only use cu.* ports (not tty.*)
-        if port.port_name.contains("/dev/tty.") {
-            continue;
-        }
-
-        if !is_neewer {
-            continue;
-        }
-
-        let label = match &port.port_type {
-            serialport::SerialPortType::UsbPort(usb) => {
-                usb.product.clone().unwrap_or_else(|| "Neewer USB".into())
+/// Enumerate the Neewer CH340 `cu.*` serial ports the OS currently exposes as
+/// `(path, label)` pairs — without opening them. Pure enumeration so callers
+/// can reconcile against the registry without risking an `open()` on a port an
+/// existing `Light` already owns.
+fn present_serial_ports() -> Vec<(String, String)> {
+    serialport::available_ports()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|port| {
+            // Only use cu.* ports (not tty.*)
+            if port.port_name.contains("/dev/tty.") {
+                return None;
             }
-            _ => "Neewer USB".into(),
-        };
+            // CH340 chips used by Neewer PL81 have vendor ID 0x1A86 (6790)
+            match &port.port_type {
+                serialport::SerialPortType::UsbPort(usb) if usb.vid == 0x1A86 => {
+                    let label = usb.product.clone().unwrap_or_else(|| "Neewer USB".into());
+                    Some((port.port_name.clone(), label))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
 
-        info!("Serial: found {} at {}", label, port.port_name);
-        match serialport::new(&port.port_name, SERIAL_BAUD)
-            .timeout(SERIAL_TIMEOUT)
-            .open()
-        {
-            Ok(serial_port) => {
-                lights.push(Light {
-                    name: format!("{} ({})", label, port.port_name),
-                    is_gl1: false,
-                    is_pl81: true,
-                    transport: Transport::Serial {
-                        port: Some(serial_port),
-                        path: port.port_name.clone(),
-                        last_reopen: stale_instant(),
-                    },
-                    state: LightState::new(),
-                });
-            }
-            Err(e) => {
-                warn!("Serial: could not open {}: {} (is Neewer Control Center running?)", port.port_name, e);
-            }
+/// Open a single serial port into a PL81 `Light`. Returns `None` (after a
+/// warn) when the OS won't hand us the handle — e.g. Neewer Control Center is
+/// holding the port open.
+fn open_serial_light(path: &str, label: &str) -> Option<Light> {
+    match serialport::new(path, SERIAL_BAUD)
+        .timeout(SERIAL_TIMEOUT)
+        .open()
+    {
+        Ok(serial_port) => Some(Light {
+            name: format!("{} ({})", label, path),
+            is_gl1: false,
+            is_pl81: true,
+            transport: Transport::Serial {
+                port: Some(serial_port),
+                path: path.to_string(),
+                last_reopen: stale_instant(),
+            },
+            state: LightState::new(),
+        }),
+        Err(e) => {
+            warn!("Serial: could not open {}: {} (is Neewer Control Center running?)", path, e);
+            None
         }
     }
+}
 
-    lights
+/// Paths of every USB-serial `Light` currently in the registry.
+fn serial_paths(all_lights: &[Light]) -> std::collections::HashSet<String> {
+    all_lights
+        .iter()
+        .filter_map(|l| match &l.transport {
+            Transport::Serial { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn discover_serial_lights() -> Vec<Light> {
+    present_serial_ports()
+        .into_iter()
+        .filter_map(|(path, label)| {
+            info!("Serial: found {} at {}", label, path);
+            open_serial_light(&path, &label)
+        })
+        .collect()
 }
 
 // ── UDP transport (GL1) ─────────────────────────────────────────
@@ -623,18 +642,94 @@ pub fn discover_serial() -> Vec<Light> {
     lights
 }
 
-/// Drop any existing USB-serial lights and re-open the current set. Used
-/// after a USB hub blip / Stream Deck re-attach to recover from `EPIPE`s on
-/// stale serial handles. BLE lights are left untouched — their actors have
-/// their own reconnect path.
+/// Recover USB-serial lights after a USB hub blip / Stream Deck re-attach.
+///
+/// Non-destructive: every existing serial `Light` is kept, with only its
+/// handle reset (`port = None`) so the next write reopens a fresh fd from
+/// `path` — that clears any `EPIPE` the blip left on the old handle, without
+/// sending a command now. Newly-present Neewer ports are added.
+///
+/// Crucially we do NOT drop lights here. A CH340 can briefly vanish from
+/// `available_ports()` mid-re-enumeration in the moments right after a hub
+/// blip; the old destructive rebuild dropped on that single snapshot, which is
+/// exactly how a healthy light disappeared from the registry permanently.
+/// `reconcile_serial` prunes genuinely-removed ports on its own cadence.
+///
+/// BLE lights are left untouched — their actors have their own reconnect path.
 pub fn refresh_serial(all_lights: &mut Vec<Light>) {
-    all_lights.retain(|l| !matches!(l.transport, Transport::Serial { .. }));
-    let fresh = discover_serial_lights();
-    info!("Serial: refreshed {} USB light(s) after USB event", fresh.len());
-    for l in &fresh {
-        info!("  - {}", l.name);
+    // Reset surviving serial handles so a stale (post-blip EPIPE) fd is
+    // reopened lazily on the next write rather than reused.
+    for l in all_lights.iter_mut() {
+        if let Transport::Serial { port, last_reopen, .. } = &mut l.transport {
+            *port = None;
+            *last_reopen = stale_instant();
+        }
     }
-    all_lights.extend(fresh);
+
+    let existing = serial_paths(all_lights);
+    let mut added = 0;
+    for (path, label) in present_serial_ports() {
+        if existing.contains(&path) {
+            continue;
+        }
+        if let Some(light) = open_serial_light(&path, &label) {
+            info!("Serial: added {} after USB event", light.name);
+            all_lights.push(light);
+            added += 1;
+        }
+    }
+    info!(
+        "Serial: refresh added {} USB light(s); {} serial light(s) tracked",
+        added,
+        serial_paths(all_lights).len()
+    );
+}
+
+/// Periodic backstop that brings the serial light set back in line with the
+/// OS. Adds Neewer ports that appeared without a hotplug event firing (or that
+/// a hotplug refresh missed due to a re-enumeration race) and drops lights
+/// whose port node is gone. Returns `true` if the registry changed so the
+/// caller can re-render.
+///
+/// Removal here is immediate, but self-correcting: this runs on a multi-second
+/// cadence at arbitrary times, so it effectively never fires inside the
+/// sub-second window where a CH340 is mid-re-enumeration — and if it ever did,
+/// the next tick re-adds the port. Cheap to call: it only enumerates ports
+/// unless something actually changed.
+pub fn reconcile_serial(all_lights: &mut Vec<Light>) -> bool {
+    let present = present_serial_ports();
+    let present_paths: std::collections::HashSet<String> =
+        present.iter().map(|(p, _)| p.clone()).collect();
+
+    let mut changed = false;
+
+    // Drop serial lights whose port node has disappeared.
+    all_lights.retain(|l| match &l.transport {
+        Transport::Serial { path, .. } => {
+            let keep = present_paths.contains(path);
+            if !keep {
+                info!("Serial: {} gone, dropping from registry", path);
+                changed = true;
+            }
+            keep
+        }
+        _ => true,
+    });
+
+    // Add present ports no existing serial light owns.
+    let existing = serial_paths(all_lights);
+    for (path, label) in present {
+        if existing.contains(&path) {
+            continue;
+        }
+        if let Some(light) = open_serial_light(&path, &label) {
+            info!("Serial: reconcile added {}", light.name);
+            all_lights.push(light);
+            changed = true;
+        }
+    }
+
+    changed
 }
 
 /// Same as `discover_serial` but skips ports whose label is already in

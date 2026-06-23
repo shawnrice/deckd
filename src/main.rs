@@ -577,6 +577,12 @@ fn start_daemon() {
     // the panel even if no button is pressed and no sleep gap is detected.
     let mut last_brightness_reassert = Instant::now();
     let brightness_reassert_interval = std::time::Duration::from_secs(60);
+    // Backstop for USB-serial lights: a hotplug event can miss a light if its
+    // CH340 is mid-re-enumeration, and some appear with no event at all. This
+    // tick reconciles the registry against the OS so a missed light self-heals
+    // without a button press.
+    let mut last_serial_reconcile = Instant::now();
+    let serial_reconcile_interval = std::time::Duration::from_secs(15);
     while !shutdown.load(Ordering::Relaxed) {
         // Detect wake from sleep: wall-clock gap >> loop iteration time.
         // Normal iteration cadence is ~50ms (the deck input poll timeout), so a
@@ -632,6 +638,16 @@ fn start_daemon() {
                 log::debug!("Periodic brightness re-assert: {}", b);
             }
             last_brightness_reassert = Instant::now();
+        }
+
+        // Periodic USB-serial reconcile. See declaration above for rationale.
+        if last_serial_reconcile.elapsed() >= serial_reconcile_interval {
+            last_serial_reconcile = Instant::now();
+            if lights::reconcile_serial(&mut all_lights) {
+                // Registry changed (light added/removed) — re-render so the
+                // light-toggle indicators reflect the new set next tick.
+                last_lcd_refresh = Instant::now() - lcd_refresh_interval;
+            }
         }
 
         // Check if BLE scan completed in background
