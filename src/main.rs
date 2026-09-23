@@ -571,9 +571,16 @@ fn start_daemon() {
     // Set when the rescan button kicks off a BLE scan; cleared when results
     // arrive so we know which key (if any) to repaint with the default image.
     let mut rescan_button_key: Option<u8> = None;
-    // Sleep/wake detection: compare wall-clock delta across iterations.
-    // If wall clock jumps forward much more than the loop period, we slept.
-    let mut last_wake_check = std::time::SystemTime::now();
+    // Sleep/wake detection. A wall-clock gap alone cannot tell suspension from
+    // CPU starvation: a loaded machine (EDR scan storms are the usual culprit)
+    // stalls this loop for seconds at a time, which a bare wall-clock test reads
+    // as a wake and answers with a full panel repaint — visible as keys blanking
+    // and fading back in.
+    //
+    // Suspension advances the wall clock while the monotonic clock stays put;
+    // starvation advances both together. Their divergence is the real signal.
+    let mut last_wake_wall = std::time::SystemTime::now();
+    let mut last_wake_mono = Instant::now();
     // Periodic brightness re-assertion. macOS display sleep can put the deck's
     // USB endpoint into selective suspend without ever pausing this process;
     // wall clock does not gap, so the wake-detection branch below cannot fire.
@@ -588,19 +595,38 @@ fn start_daemon() {
     let mut last_serial_reconcile = Instant::now();
     let serial_reconcile_interval = std::time::Duration::from_secs(15);
     while !shutdown.load(Ordering::Relaxed) {
-        // Detect wake from sleep: wall-clock gap >> loop iteration time.
-        // Normal iteration cadence is ~50ms (the deck input poll timeout), so a
-        // gap of >2s reliably means the process was suspended (system sleep,
-        // SIGSTOP, etc.). Note: display-only sleep does NOT pause the process,
-        // so wall clock keeps ticking — see last_brightness_reassert below.
-        if let Ok(elapsed) = std::time::SystemTime::now().duration_since(last_wake_check) {
-            if elapsed > std::time::Duration::from_millis(500) {
+        // Detect wake from sleep. Normal iteration cadence is ~50ms (the deck
+        // input poll timeout), but a wall-clock gap on its own does not imply
+        // suspension — a loaded machine stalls this loop just as far. Compare
+        // wall against monotonic instead; see the declarations above.
+        // Note: display-only sleep does NOT pause the process, so wall clock
+        // keeps ticking — see last_brightness_reassert below.
+        if let Ok(wall) = std::time::SystemTime::now().duration_since(last_wake_wall) {
+            let mono = last_wake_mono.elapsed();
+            // Drift is what the wall clock gained over the monotonic clock.
+            // Near zero under starvation, large after a real suspend.
+            let drift = wall.saturating_sub(mono);
+            if wall > std::time::Duration::from_millis(500) {
                 // Log noticeable but sub-threshold gaps so we can see if display
                 // sleep events ever produce a measurable but small bump here.
-                log::debug!("Loop iteration wall-clock gap: {:?}", elapsed);
+                log::debug!("Loop iteration gap: wall={:?} mono={:?} drift={:?}", wall, mono, drift);
             }
-            if elapsed > std::time::Duration::from_secs(2) {
-                info!("Detected wake from sleep (gap: {:?}), refreshing deck state", elapsed);
+            // The drift test is the primary signal. The absolute wall-clock
+            // fallback is a safety net in case the platform's monotonic clock
+            // does keep counting through suspend (in which case drift stays
+            // ~0): no plausible amount of CPU starvation stalls this loop for a
+            // full minute, and if it somehow did, a refresh is warranted anyway.
+            if drift > std::time::Duration::from_secs(2)
+                || wall > std::time::Duration::from_secs(60)
+            {
+                info!(
+                    "Detected wake from sleep (wall: {:?}, drift: {:?}), refreshing deck state",
+                    wall, drift
+                );
+                // The firmware blanks button images across a real sleep, so the
+                // render cache no longer describes the panel. Reset it or every
+                // key would be skipped as "unchanged" and stay dark.
+                render::reset_buttons(&mut deck);
                 // BLE links don't survive macOS sleep — force every actor
                 // to tear down and reconnect.
                 lights::force_reconnect_all(&mut all_lights);
@@ -631,7 +657,8 @@ fn start_daemon() {
                 last_brightness_reassert = Instant::now();
             }
         }
-        last_wake_check = std::time::SystemTime::now();
+        last_wake_wall = std::time::SystemTime::now();
+        last_wake_mono = Instant::now();
 
         // Periodic brightness re-assertion. See declaration above for rationale.
         if last_brightness_reassert.elapsed() >= brightness_reassert_interval {
