@@ -1301,6 +1301,16 @@ fn handle_light_command(
         (parts[0], None, 0, 0)
     };
 
+    // Reject an unrecognised group outright. Falling through to "matches
+    // everything" turns a config typo into a command that silently drives every
+    // light on the desk, which is indistinguishable from the group working.
+    if let Some(g) = group
+        && !matches!(g, "keylights" | "desklights" | "ble" | "serial")
+    {
+        warn!("Unknown light group '{}' in command '{}'; ignoring", g, cmd_str);
+        return;
+    }
+
     for light in all_lights.iter_mut() {
         let matches = match group {
             Some("keylights") => light.is_gl1,
@@ -1308,7 +1318,8 @@ fn handle_light_command(
             Some("ble") => light.is_gl1,
             Some("serial") => light.is_pl81,
             None => true,
-            Some(_) => true,
+            // Unreachable — the guard above returns on any other group.
+            Some(_) => false,
         };
 
         if !matches {
