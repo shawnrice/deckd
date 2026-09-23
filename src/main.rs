@@ -532,9 +532,13 @@ fn start_daemon() {
 
     let boot_start = Instant::now();
 
-    // Render buttons immediately — interactive before BLE scan finishes
+    // Render buttons immediately — interactive before BLE scan finishes.
+    // Reset first: a previous deckd run may have left images on the panel, and
+    // the render cache starts empty, so without this those keys would never be
+    // repainted or cleared.
     let mut page_stack: Vec<String> = vec![cfg.start_page()];
     let buttons = cfg.resolved_buttons(&page_stack);
+    render::reset_buttons(&mut deck);
     render::render_buttons(&mut deck, &buttons);
 
     // Startup sound (skip on quick restarts to avoid noise on USB hub resets)
@@ -771,6 +775,9 @@ fn start_daemon() {
             match deck::reconnect_blocking(std::time::Duration::from_secs(30)) {
                 Ok(new_deck) => {
                     deck = new_deck;
+                    // Fresh handle over a blank panel — the render cache
+                    // describes the old one, so drop it before any render.
+                    render::reset_buttons(&mut deck);
                     let b = cfg.brightness.unwrap_or(80);
                     info!("Setting deck brightness to {} (after reconnect)", b);
                     deck.set_brightness(b)

@@ -1,4 +1,7 @@
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::{Mutex, OnceLock};
 
 use ab_glyph::{Font as AbFont, FontRef, PxScale, ScaleFont};
 use elgato_streamdeck::StreamDeck;
@@ -70,6 +73,90 @@ fn text_width(text: &str, f: &FontRef, scale: PxScale) -> f32 {
             scaled.h_advance(glyph_id)
         })
         .sum()
+}
+
+// ── Button image cache ────────────────────────────────────────────
+
+/// Hash of the image last written to each key. The deck offers no read-back,
+/// so this is our only record of what is actually on the panel. Every write
+/// goes through it so a key whose content has not changed is left alone —
+/// repainting a key costs a JPEG encode plus a USB transfer, and blanking one
+/// before repainting is what makes the panel visibly flicker.
+///
+/// A key absent from the map is considered blank. That invariant only holds if
+/// the cache is dropped whenever the panel is cleared behind our back — see
+/// `reset_buttons`.
+fn button_cache() -> &'static Mutex<HashMap<u8, u64>> {
+    static CACHE: OnceLock<Mutex<HashMap<u8, u64>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn image_hash(img: &DynamicImage) -> u64 {
+    let mut h = DefaultHasher::new();
+    img.as_bytes().hash(&mut h);
+    h.finish()
+}
+
+/// Blank the panel and drop the cache, establishing a known state.
+///
+/// Call this anywhere the panel's contents may no longer match what we believe
+/// we wrote: at startup (a previous deckd run may have left images behind), on
+/// reconnect (a fresh handle over a dark panel), and on a real sleep/wake (the
+/// firmware blanks button images). Skipping it there would leave keys dark,
+/// because every subsequent write would be cached away as "unchanged".
+pub fn reset_buttons(deck: &mut StreamDeck) {
+    deck.clear_all_button_images().ok();
+    deck.flush().ok();
+    if let Ok(mut c) = button_cache().lock() {
+        c.clear();
+    }
+}
+
+/// Write `img` to `key` only if it differs from what we last wrote there.
+/// Returns whether the deck was actually touched, so callers can skip the flush.
+fn set_button_cached(deck: &mut StreamDeck, key: u8, img: DynamicImage) -> bool {
+    let hash = image_hash(&img);
+    let unchanged = button_cache()
+        .lock()
+        .ok()
+        .map(|c| c.get(&key) == Some(&hash))
+        .unwrap_or(false);
+    if unchanged {
+        return false;
+    }
+    if let Err(e) = deck.set_button_image(key, img) {
+        error!("Failed to set image for key {}: {}", key, e);
+        // Forget the key rather than recording a write that did not land, so
+        // the next render retries instead of caching the failure away.
+        if let Ok(mut c) = button_cache().lock() {
+            c.remove(&key);
+        }
+        return false;
+    }
+    if let Ok(mut c) = button_cache().lock() {
+        c.insert(key, hash);
+    }
+    true
+}
+
+/// Blank `key` unless we already believe it is blank.
+fn clear_button_cached(deck: &mut StreamDeck, key: u8) -> bool {
+    let already_blank = button_cache()
+        .lock()
+        .ok()
+        .map(|c| !c.contains_key(&key))
+        .unwrap_or(false);
+    if already_blank {
+        return false;
+    }
+    if let Err(e) = deck.clear_button_image(key) {
+        error!("Failed to clear key {}: {}", key, e);
+        return false;
+    }
+    if let Ok(mut c) = button_cache().lock() {
+        c.remove(&key);
+    }
+    true
 }
 
 // ── Button rendering ──────────────────────────────────────────────
@@ -170,7 +257,12 @@ pub fn render_buttons(deck: &mut StreamDeck, buttons: &HashMap<String, ButtonCon
     let key_count = deck.kind().key_count();
     let key_size = 120_u32;
 
-    deck.clear_all_button_images().ok();
+    // Incremental: render every key this page defines, but only push the ones
+    // whose image actually changed. Keys left over from the previous page are
+    // blanked afterwards. Nothing is cleared up front, so an unchanged page
+    // (the common case on a spurious refresh) touches the deck zero times.
+    let mut touched = false;
+    let mut live: HashSet<u8> = HashSet::new();
 
     for (key_str, button) in buttons {
         let key: u8 = match key_str.parse() {
@@ -181,7 +273,7 @@ pub fn render_buttons(deck: &mut StreamDeck, buttons: &HashMap<String, ButtonCon
             }
         };
 
-        if let Some(icon_path) = &button.icon {
+        let img = if let Some(icon_path) = &button.icon {
             match image::open(icon_path) {
                 Ok(img) => {
                     // Compose icon onto a dark background, centered, with padding
@@ -193,11 +285,12 @@ pub fn render_buttons(deck: &mut StreamDeck, buttons: &HashMap<String, ButtonCon
                     let ox = (key_size - resized.width()) / 2;
                     let oy = (key_size - resized.height()) / 2;
                     image::imageops::overlay(&mut canvas, &resized.to_rgba8(), ox as i64, oy as i64);
-                    if let Err(e) = deck.set_button_image(key, DynamicImage::ImageRgba8(canvas)) {
-                        error!("Failed to set image for key {}: {}", key, e);
-                    }
+                    Some(DynamicImage::ImageRgba8(canvas))
                 }
-                Err(e) => error!("Failed to load icon '{}': {}", icon_path, e),
+                Err(e) => {
+                    error!("Failed to load icon '{}': {}", icon_path, e);
+                    None
+                }
             }
         } else if let Some(label) = &button.label {
             let bg = button
@@ -212,14 +305,29 @@ pub fn render_buttons(deck: &mut StreamDeck, buttons: &HashMap<String, ButtonCon
                 .unwrap_or(Rgba([220, 220, 220, 255]));
 
             let icon_name = button.icon_name.as_deref();
-            let img = render_button(label, icon_name, key_size, bg, fg);
-            if let Err(e) = deck.set_button_image(key, img) {
-                error!("Failed to set label for key {}: {}", key, e);
-            }
+            Some(render_button(label, icon_name, key_size, bg, fg))
+        } else {
+            None
+        };
+
+        if let Some(img) = img {
+            live.insert(key);
+            touched |= set_button_cached(deck, key, img);
         }
     }
 
-    if let Err(e) = deck.flush() {
+    // Blank keys the previous page painted that this one does not define.
+    // Collected first so the cache lock is released before we write.
+    let stale: Vec<u8> = button_cache()
+        .lock()
+        .ok()
+        .map(|c| c.keys().copied().filter(|k| !live.contains(k)).collect())
+        .unwrap_or_default();
+    for key in stale {
+        touched |= clear_button_cached(deck, key);
+    }
+
+    if touched && let Err(e) = deck.flush() {
         error!("Failed to flush button images: {}", e);
     }
 }
@@ -1232,8 +1340,9 @@ pub fn render_light_toggle_button(deck: &mut StreamDeck, on: bool) {
         ("Lights: Off", parse_hex("#3a1a1a"), parse_hex("#ff6666"))
     };
     let img = render_button(label, Some("power"), key_size, bg, fg);
-    deck.set_button_image(0, img).ok();
-    deck.flush().ok();
+    if set_button_cached(deck, 0, img) {
+        deck.flush().ok();
+    }
 }
 
 /// Render the rescan button at the given key index. When `scanning` is true,
@@ -1247,8 +1356,9 @@ pub fn render_rescan_button(deck: &mut StreamDeck, key: u8, scanning: bool) {
         ("Rescan", parse_hex("#1a1a2e"), parse_hex("#70b8ff"))
     };
     let img = render_button(label, Some("refresh"), key_size, bg, fg);
-    deck.set_button_image(key, img).ok();
-    deck.flush().ok();
+    if set_button_cached(deck, key, img) {
+        deck.flush().ok();
+    }
 }
 
 /// Render a stateful mic mute button on button 0.
@@ -1261,8 +1371,9 @@ pub fn render_mic_button(deck: &mut StreamDeck, muted: bool) {
         ("Mic: On", "mic", parse_hex("#1a3a1a"), parse_hex("#66ff66"))
     };
     let img = render_button(label, Some(icon), key_size, bg, fg);
-    deck.set_button_image(0, img).ok();
-    deck.flush().ok();
+    if set_button_cached(deck, 0, img) {
+        deck.flush().ok();
+    }
 }
 
 pub fn render_camera_state_buttons(deck: &mut StreamDeck, state: &crate::camera::CameraState) {
@@ -1280,29 +1391,33 @@ pub fn render_camera_state_buttons(deck: &mut StreamDeck, state: &crate::camera:
         _ => "Narrow 65",
     };
 
+    let mut touched = false;
+
     // Button 0: FOV (not a toggle, shows current)
     let img = render_button(fov_label, Some("zoom_in"), key_size, parse_hex("#1a1a2e"), parse_hex("#70b8ff"));
-    deck.set_button_image(0, img).ok();
+    touched |= set_button_cached(deck, 0, img);
 
     // Button 1: RightLight
     if state.has_xu {
         let img = toggle_btn(if state.rightlight { "RL: On" } else { "RL: Off" }, state.rightlight, "sun");
-        deck.set_button_image(1, img).ok();
+        touched |= set_button_cached(deck, 1, img);
     }
 
     // Button 2: Auto WB
     let img = toggle_btn(if state.auto_wb { "AWB: On" } else { "AWB: Off" }, state.auto_wb, "moon");
-    deck.set_button_image(2, img).ok();
+    touched |= set_button_cached(deck, 2, img);
 
     // Button 3: Auto Exposure
     let img = toggle_btn(if state.auto_exposure { "AE: On" } else { "AE: Off" }, state.auto_exposure, "eye");
-    deck.set_button_image(3, img).ok();
+    touched |= set_button_cached(deck, 3, img);
 
     // Button 4: Autofocus
     let img = toggle_btn(if state.auto_focus { "AF: On" } else { "AF: Off" }, state.auto_focus, "af");
-    deck.set_button_image(4, img).ok();
+    touched |= set_button_cached(deck, 4, img);
 
-    deck.flush().ok();
+    if touched {
+        deck.flush().ok();
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
