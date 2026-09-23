@@ -634,18 +634,8 @@ fn start_daemon() {
                 // blanks button images during macOS sleep.
                 render_page(&mut deck, &cfg, &page_stack);
                 // Re-apply stateful button overrides for the current page
-                let cp = current_page(&page_stack);
-                if cp == "keylights" {
-                    render::render_light_toggle_button(&mut deck, lights::keylights_on(&all_lights));
-                } else if cp == "desklights" {
-                    render::render_light_toggle_button(&mut deck, lights::desklights_on(&all_lights));
-                } else if cp == "meeting" {
-                    let muted = dash_state.lock().map(|s| s.mic_muted).unwrap_or(false);
-                    render::render_mic_button(&mut deck, muted);
-                } else if cp == "cam_settings" {
-                    cam_state.sync_from_device();
-                    render::render_camera_state_buttons(&mut deck, &cam_state);
-                }
+                let cp = current_page(&page_stack).to_string();
+                render_stateful_buttons(&mut deck, &cp, &all_lights, &mut cam_state, &dash_state);
                 // Force LCD refresh next tick
                 last_lcd_refresh = Instant::now() - lcd_refresh_interval;
                 // Restore brightness (in case firmware dimmed it)
@@ -846,26 +836,15 @@ fn start_daemon() {
                     }
                     last_brightness_reassert = Instant::now();
                     let cp = current_page(&page_stack);
-                    // Sync camera state when entering any camera page. The
-                    // settings page needs it for the AF/AE/AWB/FOV/RL toggle
-                    // displays; the PTZ page needs it so pan/tilt/zoom knob
-                    // movements are relative to the camera's actual position.
-                    if cp == "cam_settings" {
+                    // Stateful overrides for the page we just entered
+                    // (cam_settings syncs the camera as part of this).
+                    let cp = cp.to_string();
+                    render_stateful_buttons(&mut deck, &cp, &all_lights, &mut cam_state, &dash_state);
+                    // The PTZ page renders nothing stateful, but still needs a
+                    // sync so knob movements are relative to the camera's
+                    // actual pan/tilt/zoom rather than a stale copy.
+                    if cp == "camera" {
                         cam_state.sync_from_device();
-                        render::render_camera_state_buttons(&mut deck, &cam_state);
-                    } else if cp == "camera" {
-                        cam_state.sync_from_device();
-                    }
-                    // Render stateful light toggle on entry
-                    if cp == "keylights" {
-                        render::render_light_toggle_button(&mut deck, lights::keylights_on(&all_lights));
-                    } else if cp == "desklights" {
-                        render::render_light_toggle_button(&mut deck, lights::desklights_on(&all_lights));
-                    }
-                    // Render stateful mic button on meeting page entry
-                    if cp == "meeting" {
-                        let muted = dash_state.lock().map(|s| s.mic_muted).unwrap_or(false);
-                        render::render_mic_button(&mut deck, muted);
                     }
                     last_lcd_refresh = Instant::now() - lcd_refresh_interval;
                 }
@@ -1056,6 +1035,10 @@ fn start_daemon() {
                     info!("Config reloaded from {}", config_path.display());
                     audio_cycler.refresh(&cfg.output_devices, &cfg.input_devices);
                     render_page(&mut deck, &cfg, &page_stack);
+                    // render_page repaints config's placeholder labels, so the
+                    // live state has to be laid back over them.
+                    let cp = current_page(&page_stack).to_string();
+                    render_stateful_buttons(&mut deck, &cp, &all_lights, &mut cam_state, &dash_state);
                     last_lcd_refresh = Instant::now() - lcd_refresh_interval;
 
                     if let Ok(mut s) = dash_state.lock() {
@@ -1261,6 +1244,35 @@ fn action_triggers_ble_scan(action: Option<&config::Action>) -> bool {
             .iter()
             .any(|a| action_triggers_ble_scan(Some(a))),
         _ => false,
+    }
+}
+
+/// Re-apply the stateful button overrides for `page`.
+///
+/// These keys exist in config so the page has something to paint, but their
+/// labels are placeholders — the real content depends on live device state.
+/// Any path that calls `render_page` must follow it with this, or the
+/// placeholder is what the user is left looking at (config's literal
+/// "Lights: On" / "Mic: On", which are wrong whenever the device is off).
+fn render_stateful_buttons(
+    deck: &mut elgato_streamdeck::StreamDeck,
+    page: &str,
+    all_lights: &[lights::Light],
+    cam_state: &mut camera::CameraState,
+    dash_state: &dashboard::SharedDashboard,
+) {
+    match page {
+        "keylights" => render::render_light_toggle_button(deck, lights::keylights_on(all_lights)),
+        "desklights" => render::render_light_toggle_button(deck, lights::desklights_on(all_lights)),
+        "meeting" => {
+            let muted = dash_state.lock().map(|s| s.mic_muted).unwrap_or(false);
+            render::render_mic_button(deck, muted);
+        }
+        "cam_settings" => {
+            cam_state.sync_from_device();
+            render::render_camera_state_buttons(deck, cam_state);
+        }
+        _ => {}
     }
 }
 
